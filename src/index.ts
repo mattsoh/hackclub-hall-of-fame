@@ -1,6 +1,7 @@
 import * as dotenv from "dotenv";
 import { App, ExpressReceiver } from "@slack/bolt";
 import * as events from "./events/index";
+import prisma from "./utils/prisma";
 
 dotenv.config();
 
@@ -11,8 +12,17 @@ export const app = new App({
   token: process.env.SLACK_BOLT_TOKEN,
   receiver: expressReceiver,
 });
-expressReceiver.app.get("/", (req, res) => {
-  res.status(200).type("text/plain").send("hi, this is Hack Club's hall of fame");
+expressReceiver.app.get("/", async (req, res) => {
+  let dbStatus = "connected";
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+  } catch (err) {
+    dbStatus = "unavailable";
+  }
+  res
+    .status(200)
+    .type("text/plain")
+    .send(`hi, this is Hack Club's hall of fame\ndatabase: ${dbStatus}`);
 });
 
 expressReceiver.app.get("/status", (req, res) => {
