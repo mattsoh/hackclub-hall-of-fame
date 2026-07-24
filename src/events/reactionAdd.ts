@@ -81,7 +81,7 @@ const reactionAddEvent = async (app: App): Promise<void> => {
           ts: entry.postedMessageId as string,
           text,
         });
-      } else {
+      } else if (entry.announce) {
         // Post new message
         const message = `⭐ *${entry.stars}*\n${permalink}`;
 
@@ -101,6 +101,9 @@ const reactionAddEvent = async (app: App): Promise<void> => {
           }
         );
       }
+      // else: announce === false means this entry was deliberately excluded
+      // (backfilled historical data, or already surfaced via a review thread)
+      // — never auto-post for it, even if it crosses the threshold again.
     }
   });
 };
