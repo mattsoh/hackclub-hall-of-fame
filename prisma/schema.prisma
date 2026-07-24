@@ -18,4 +18,5 @@ model Message {
   channelId       String
   stars           Int     @default(0)
   postedMessageId String?
+  announce        Boolean @default(true)
 }
