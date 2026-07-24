@@ -11,6 +11,10 @@ export const app = new App({
   token: process.env.SLACK_BOLT_TOKEN,
   receiver: expressReceiver,
 });
+expressReceiver.app.get("/", (req, res) => {
+  res.status(200).type("text/plain").send("hi, this is Hack Club's hall of fame");
+});
+
 expressReceiver.app.get("/status", (req, res) => {
   res.status(200).send();
 });
