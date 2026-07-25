@@ -1,4 +1,5 @@
 import { App } from "@slack/bolt";
+import { logError } from "../utils/log";
 
 const channelCreateEvent = async (app: App): Promise<void> => {
   app.event("channel_created", async ({ event, client }) => {
@@ -36,7 +37,7 @@ const channelCreateEvent = async (app: App): Promise<void> => {
         ],
       });
     } catch (e) {
-      console.error(e);
+      await logError(app.client, "channel_created handler failed", e);
     }
   });
 
