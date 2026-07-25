@@ -38,6 +38,10 @@ const RECENT_WINDOW_DAYS = 30;
 const MAX_MESSAGE_AGE_DAYS = 365;
 
 const PENDING_AUTO_SEND_THRESHOLD = 10;
+// When the pending batch is over the threshold, anything this recent is still
+// sent rather than held back — a message from the last day is current enough
+// that the bot being briefly down shouldn't cost it its announcement.
+const SEND_CATCHUP_WINDOW_HOURS = 24;
 const THREAD_CHUNK_SIZE = 40;
 const ERROR_SAMPLE_SIZE = 10;
 
@@ -181,13 +185,31 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
      WHERE "postedMessageId" IS NOT NULL AND "postedMessageId" != ''`
   );
   const dbPostedByPostedId = new Map(postedRes.rows.map((r) => [r.postedMessageId as string, r]));
+  // Origins already recorded as announced. "Message" is keyed on the origin
+  // message, so a row holds exactly one postedMessageId — once any copy of an
+  // announcement is recorded, that origin is covered and the remaining copies
+  // can never be stored.
+  const dbPostedOrigins = new Set(postedRes.rows.map((r) => r.messageId));
   await logInfo(app.client, `Sync job: loaded ${postedRes.rows.length} posted messages from DB.`);
 
+  // An announcement counts as missing only when its *origin* has no row yet.
+  // Keying this on the announcement's own ts (as it used to) meant the extra
+  // copies of a duplicated announcement were reported missing on every run and
+  // "backfilled" every run — and because the set was built from the missing
+  // copies alone, it always picked one the DB wasn't pointing at, so each run
+  // rewrote postedMessageId to a different copy and the next run swapped it
+  // back. The channel has ~362 duplicate announcements across 191 origins, so
+  // that was ~191 rows churning in perpetuity and an alert that could never
+  // report a clean run.
   const missingFromDb: Array<{ postedTs: string } & SlackPost> = [];
+  let duplicateAnnouncements = 0;
   for (const [ts, post] of slackPosts) {
-    if (!dbPostedByPostedId.has(ts)) {
-      missingFromDb.push({ postedTs: ts, ...post });
+    if (dbPostedByPostedId.has(ts)) continue;
+    if (post.originTs && dbPostedOrigins.has(post.originTs)) {
+      duplicateAnnouncements++;
+      continue;
     }
+    missingFromDb.push({ postedTs: ts, ...post });
   }
 
   const deletedFromSlack = postedRes.rows.filter((r) => !slackPosts.has(r.postedMessageId as string));
@@ -202,6 +224,9 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     const existing = byOrigin.get(key);
     if (!existing || row.stars > existing.stars) byOrigin.set(key, row);
   }
+  // Extra copies among origins being backfilled for the first time this run:
+  // only one of them can be stored, so the rest are duplicates too.
+  duplicateAnnouncements += missingFromDb.length - byOrigin.size;
 
   if (byOrigin.size > 0) {
     await logInfo(app.client, `Sync job: backfilling ${byOrigin.size} messages missing from DB...`);
@@ -402,6 +427,11 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- lookup errors: ${lookupErrors}` +
     (lookupErrorBreakdown ? ` (${lookupErrorBreakdown})` : "");
 
+  if (duplicateAnnouncements > 0) {
+    baseSummary +=
+      `\n- duplicate announcements in the channel: ${duplicateAnnouncements} ` +
+      `(same origin announced more than once; only one copy can be tracked per message)`;
+  }
   if (heldBackCount > 0) {
     baseSummary += `\n- previously held back (announce=false), not re-listed: ${heldBackCount}`;
   }
@@ -422,10 +452,35 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   let summary = baseSummary;
   const threadSections: Array<{ title: string; lines: string[] }> = [];
 
-  if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {
-    await logInfo(app.client, `Sync job: auto-sending ${pending.length} pending announcements...`);
+  // An over-threshold batch means something went wrong — an outage, or a long
+  // gap in reaction events — rather than a normal trickle, and replaying all
+  // of it into #hall-of-fame at once isn't wanted. But losing the recent end
+  // of it isn't either: those messages are still current and would have been
+  // posted individually had the bot been up. So the newest
+  // PENDING_AUTO_SEND_THRESHOLD still go out, along with anything from the
+  // last SEND_CATCHUP_WINDOW_HOURS however many that is, and only the older
+  // remainder is held back.
+  const newestFirst = [...pending].sort((a, b) => tsSeconds(b.messageId) - tsSeconds(a.messageId));
+  let toSend = newestFirst;
+  let toHold: DbRow[] = [];
+
+  if (pending.length > PENDING_AUTO_SEND_THRESHOLD) {
+    const catchupCutoff = Math.floor(Date.now() / 1000) - SEND_CATCHUP_WINDOW_HOURS * 60 * 60;
+    const sending = new Set(newestFirst.slice(0, PENDING_AUTO_SEND_THRESHOLD).map((r) => r.messageId));
+    for (const row of newestFirst) {
+      if (tsSeconds(row.messageId) >= catchupCutoff) sending.add(row.messageId);
+    }
+    toSend = newestFirst.filter((r) => sending.has(r.messageId));
+    toHold = newestFirst.filter((r) => !sending.has(r.messageId));
+  }
+
+  // Post oldest-first so the channel reads chronologically.
+  const sendOrder = [...toSend].reverse();
+
+  if (sendOrder.length > 0) {
+    await logInfo(app.client, `Sync job: auto-sending ${sendOrder.length} pending announcements...`);
     const sentLines: string[] = [];
-    for (const row of pending) {
+    for (const row of sendOrder) {
       const link = originLink(row.channelId, row.messageId);
       const text = `⭐ *${row.stars}*\n${link}`;
       const posted = await app.client.chat.postMessage({ channel: HALL_OF_FAME_CHANNEL, text });
@@ -439,23 +494,28 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
       sentLines.push(`${row.stars}⭐ ${link}`);
       await delay(SEND_DELAY_MS);
     }
-    summary += `\n- pending announcements: ${pending.length} (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):\n${sentLines.join("\n")}`;
-  } else if (pending.length > PENDING_AUTO_SEND_THRESHOLD) {
-    // A batch this size means something went wrong (an outage, a long gap in
-    // reaction events) rather than a normal trickle, and dumping it into
-    // #hall-of-fame at once isn't wanted. Record that decision by clearing
-    // `announce`, which holds them back for good — not just for this run, but
-    // against reactionAdd.ts too, so a single new star on a stale message
-    // can't leak one into the channel later. Re-posting any of them is then a
-    // deliberate act: flip the flag back and let sendPendingAnnouncements.js
-    // pick them up.
+    summary +=
+      `\n- pending announcements: ${pending.length}` +
+      (toHold.length > 0
+        ? ` (> ${PENDING_AUTO_SEND_THRESHOLD}; sent the newest ${PENDING_AUTO_SEND_THRESHOLD} plus everything from the last ${SEND_CATCHUP_WINDOW_HOURS}h — ${sendOrder.length} in all):`
+        : ` (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):`) +
+      `\n${sentLines.join("\n")}`;
+  }
+
+  if (toHold.length > 0) {
+    // Clearing `announce` records the decision not to post these. Because
+    // every posting path refuses on a false flag, it holds them back for good
+    // — not just for this run, but against reactionAdd.ts too, so a single new
+    // star on a stale message can't leak one into the channel later. Reposting
+    // is then a deliberate act: flip the flag back and let
+    // sendPendingAnnouncements.js pick them up.
     await db.query(`UPDATE "Message" SET announce = false WHERE "messageId" = ANY($1::text[])`, [
-      pending.map((row) => row.messageId),
+      toHold.map((row) => row.messageId),
     ]);
-    summary += `\n- pending announcements: ${pending.length} (> ${PENDING_AUTO_SEND_THRESHOLD}, NOT posted — held back, see thread)`;
+    summary += `\n- held back (older backlog, not posted): ${toHold.length} — see thread`;
     threadSections.push({
-      title: `Held back — too many to post at once (${pending.length} > ${PENDING_AUTO_SEND_THRESHOLD}). Not posted, and won't be unless you flip announce back:`,
-      lines: pending.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
+      title: `Held back — older than the last ${SEND_CATCHUP_WINDOW_HOURS}h and outside the newest ${PENDING_AUTO_SEND_THRESHOLD}. Not posted, and won't be unless you flip announce back:`,
+      lines: toHold.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
     });
   }
 
