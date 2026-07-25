@@ -181,13 +181,31 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
      WHERE "postedMessageId" IS NOT NULL AND "postedMessageId" != ''`
   );
   const dbPostedByPostedId = new Map(postedRes.rows.map((r) => [r.postedMessageId as string, r]));
+  // Origins already recorded as announced. "Message" is keyed on the origin
+  // message, so a row holds exactly one postedMessageId — once any copy of an
+  // announcement is recorded, that origin is covered and the remaining copies
+  // can never be stored.
+  const dbPostedOrigins = new Set(postedRes.rows.map((r) => r.messageId));
   await logInfo(app.client, `Sync job: loaded ${postedRes.rows.length} posted messages from DB.`);
 
+  // An announcement counts as missing only when its *origin* has no row yet.
+  // Keying this on the announcement's own ts (as it used to) meant the extra
+  // copies of a duplicated announcement were reported missing on every run and
+  // "backfilled" every run — and because the set was built from the missing
+  // copies alone, it always picked one the DB wasn't pointing at, so each run
+  // rewrote postedMessageId to a different copy and the next run swapped it
+  // back. The channel has ~362 duplicate announcements across 191 origins, so
+  // that was ~191 rows churning in perpetuity and an alert that could never
+  // report a clean run.
   const missingFromDb: Array<{ postedTs: string } & SlackPost> = [];
+  let duplicateAnnouncements = 0;
   for (const [ts, post] of slackPosts) {
-    if (!dbPostedByPostedId.has(ts)) {
-      missingFromDb.push({ postedTs: ts, ...post });
+    if (dbPostedByPostedId.has(ts)) continue;
+    if (post.originTs && dbPostedOrigins.has(post.originTs)) {
+      duplicateAnnouncements++;
+      continue;
     }
+    missingFromDb.push({ postedTs: ts, ...post });
   }
 
   const deletedFromSlack = postedRes.rows.filter((r) => !slackPosts.has(r.postedMessageId as string));
@@ -202,6 +220,9 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     const existing = byOrigin.get(key);
     if (!existing || row.stars > existing.stars) byOrigin.set(key, row);
   }
+  // Extra copies among origins being backfilled for the first time this run:
+  // only one of them can be stored, so the rest are duplicates too.
+  duplicateAnnouncements += missingFromDb.length - byOrigin.size;
 
   if (byOrigin.size > 0) {
     await logInfo(app.client, `Sync job: backfilling ${byOrigin.size} messages missing from DB...`);
@@ -402,6 +423,11 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- lookup errors: ${lookupErrors}` +
     (lookupErrorBreakdown ? ` (${lookupErrorBreakdown})` : "");
 
+  if (duplicateAnnouncements > 0) {
+    baseSummary +=
+      `\n- duplicate announcements in the channel: ${duplicateAnnouncements} ` +
+      `(same origin announced more than once; only one copy can be tracked per message)`;
+  }
   if (heldBackCount > 0) {
     baseSummary += `\n- previously held back (announce=false), not re-listed: ${heldBackCount}`;
   }
