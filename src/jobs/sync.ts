@@ -259,6 +259,9 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   let deletedAnnouncementCount = 0;
   const transientUpdateErrors: string[] = [];
   const uneditableSamples: string[] = [];
+  // Reason -> count, so a run reports *why* lookups failed rather than just
+  // how many did.
+  const lookupErrorsByReason = new Map<string, number>();
 
   for (const row of toCheck) {
     const result = await getLiveStarCount(app.client, row.channelId, row.messageId);
@@ -266,6 +269,8 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
 
     if (!result.ok) {
       lookupErrors++;
+      const reason = result.error ?? "unknown";
+      lookupErrorsByReason.set(reason, (lookupErrorsByReason.get(reason) ?? 0) + 1);
       continue;
     }
     if (result.stars === row.stars) continue;
@@ -330,10 +335,15 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await db.query(`UPDATE "AppState" SET "lastSyncedTs" = $1 WHERE id = 1`, [String(nextCursor)]);
 
   const updateErrors = transientUpdateErrors.length;
+  const lookupErrorBreakdown = [...lookupErrorsByReason.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join(", ");
   await logInfo(
     app.client,
     `Sync job: finished live star check — ${starMismatchCorrected} announcements corrected, ${driftedCount} unposted drifted, ` +
-      `${uneditableCount} un-editable, ${lookupErrors} lookup errors out of ${toCheck.length} checked.`
+      `${uneditableCount} un-editable, ${lookupErrors} lookup errors out of ${toCheck.length} checked` +
+      (lookupErrorBreakdown ? ` (${lookupErrorBreakdown}).` : ".")
   );
 
   // Rows that are unposted, qualify (>= 5 live stars), and haven't been
@@ -375,7 +385,8 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- deleted from Slack: ${deletedFromSlack.length}\n` +
     `- star mismatches (corrected): ${starMismatchCorrected}\n` +
     `- update errors (will retry): ${updateErrors}\n` +
-    `- lookup errors: ${lookupErrors}`;
+    `- lookup errors: ${lookupErrors}` +
+    (lookupErrorBreakdown ? ` (${lookupErrorBreakdown})` : "");
 
   if (uneditableCount > 0) {
     baseSummary +=
