@@ -42,6 +42,9 @@ const PENDING_AUTO_SEND_THRESHOLD = 10;
 // sent rather than held back — a message from the last day is current enough
 // that the bot being briefly down shouldn't cost it its announcement.
 const SEND_CATCHUP_WINDOW_HOURS = 24;
+// Mirrors the per-channel limit in reactionAdd.ts: at most this many
+// announcements from a single channel in one burst.
+const CHANNEL_POST_LIMIT = 3;
 const THREAD_CHUNK_SIZE = 40;
 const ERROR_SAMPLE_SIZE = 10;
 
@@ -477,10 +480,27 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   // Post oldest-first so the channel reads chronologically.
   const sendOrder = [...toSend].reverse();
 
+  // Same limit the live handler applies: no more than CHANNEL_POST_LIMIT
+  // announcements from one channel in quick succession. A catch-up batch posts
+  // its whole set within a couple of minutes, so without this a single busy
+  // channel could take over #hall-of-fame — the current backlog alone has
+  // three pending from one channel inside the newest ten.
+  const perChannelSent = new Map<string, number>();
+  const throttled: DbRow[] = [];
+
   if (sendOrder.length > 0) {
     await logInfo(app.client, `Sync job: auto-sending ${sendOrder.length} pending announcements...`);
     const sentLines: string[] = [];
     for (const row of sendOrder) {
+      const alreadySent = perChannelSent.get(row.channelId) ?? 0;
+      if (alreadySent >= CHANNEL_POST_LIMIT) {
+        // Deliberately left untouched: still unposted, still announce = true,
+        // so the next run picks it up as pending rather than losing it.
+        throttled.push(row);
+        continue;
+      }
+      perChannelSent.set(row.channelId, alreadySent + 1);
+
       const link = originLink(row.channelId, row.messageId);
       const text = `⭐ *${row.stars}*\n${link}`;
       const posted = await app.client.chat.postMessage({ channel: HALL_OF_FAME_CHANNEL, text });
@@ -497,9 +517,13 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     summary +=
       `\n- pending announcements: ${pending.length}` +
       (toHold.length > 0
-        ? ` (> ${PENDING_AUTO_SEND_THRESHOLD}; sent the newest ${PENDING_AUTO_SEND_THRESHOLD} plus everything from the last ${SEND_CATCHUP_WINDOW_HOURS}h — ${sendOrder.length} in all):`
-        : ` (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):`) +
-      `\n${sentLines.join("\n")}`;
+        ? ` (> ${PENDING_AUTO_SEND_THRESHOLD}; eligible to send: the newest ${PENDING_AUTO_SEND_THRESHOLD} plus everything from the last ${SEND_CATCHUP_WINDOW_HOURS}h — ${sendOrder.length} in all)`
+        : ` (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically)`) +
+      `\n- sent: ${sentLines.length}` +
+      (throttled.length > 0
+        ? `\n- deferred to the next run (over the ${CHANNEL_POST_LIMIT}-per-channel limit): ${throttled.length}`
+        : "") +
+      (sentLines.length > 0 ? `\n${sentLines.join("\n")}` : "");
   }
 
   if (toHold.length > 0) {

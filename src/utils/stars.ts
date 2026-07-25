@@ -19,9 +19,25 @@ export async function getLiveStarCount(
 ): Promise<StarLookup> {
   try {
     const res = await client.reactions.get({ channel, timestamp: ts });
-    const reactions = (res.message as Record<string, any> | undefined)?.reactions as Array<Record<string, any>> | undefined;
+    const message = res.message as Record<string, any> | undefined;
+    const reactions = message?.reactions as Array<Record<string, any>> | undefined;
     const star = reactions?.find((r) => r.name === "star");
-    return { ok: true, stars: star ? star.count : 0 };
+    if (!star) return { ok: true, stars: 0 };
+
+    // A message's author starring their own post shouldn't help it qualify.
+    // The reaction_added handlers already ignore the author's own event, but
+    // that only stops it triggering a check — the count itself came straight
+    // from Slack and included their star, so an author could still supply one
+    // of the five.
+    //
+    // `count` is authoritative; `users` is truncated at 50 by Slack, so on a
+    // message with more reactions than that the author may not be visible and
+    // no adjustment is made. That only ever leaves the displayed number one
+    // too high on posts far above the threshold, and never subtracts a star
+    // that wasn't there.
+    const author = message?.user as string | undefined;
+    const authorStarred = Boolean(author && Array.isArray(star.users) && star.users.includes(author));
+    return { ok: true, stars: Math.max(0, star.count - (authorStarred ? 1 : 0)) };
   } catch (err) {
     // Callers can't act on an individual failure, but the *reason* decides
     // whether a run's lookup errors are benign (the message was deleted) or a
