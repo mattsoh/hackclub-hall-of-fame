@@ -87,7 +87,10 @@ const reactionAddEvent = async (app: App): Promise<void> => {
 
     let count = 0;
     for (const recentEntry of recentEntries) {
-      const time = new Date(Number(recentEntry.postedMessageId ?? 0));
+      // postedMessageId is a Slack ts — seconds, not milliseconds. Reading it
+      // as milliseconds put every comparison in January 1970, so the count
+      // never rose above zero and this limit has never actually fired.
+      const time = new Date(Number(recentEntry.postedMessageId ?? 0) * 1000);
 
       if (time.valueOf() > new Date().valueOf() - (1000 * 60 * 5)) {
         count++;
