@@ -1,7 +1,7 @@
 import { App, ReactionMessageItem } from "@slack/bolt";
 import prisma from "../utils/prisma";
 import { getLiveStarCount, slackErrorCode, PERMANENT_UPDATE_ERRORS } from "../utils/stars";
-import { logError } from "../utils/log";
+import { logError, logInfo } from "../utils/log";
 
 const reactionRemoveEvent = async (app: App): Promise<void> => {
   app.event("reaction_removed", async ({ event, client }) => {
