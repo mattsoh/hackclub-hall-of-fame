@@ -259,6 +259,9 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   let deletedAnnouncementCount = 0;
   const transientUpdateErrors: string[] = [];
   const uneditableSamples: string[] = [];
+  // Reason -> count, so a run reports *why* lookups failed rather than just
+  // how many did.
+  const lookupErrorsByReason = new Map<string, number>();
 
   for (const row of toCheck) {
     const result = await getLiveStarCount(app.client, row.channelId, row.messageId);
@@ -266,15 +269,19 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
 
     if (!result.ok) {
       lookupErrors++;
+      const reason = result.error ?? "unknown";
+      lookupErrorsByReason.set(reason, (lookupErrorsByReason.get(reason) ?? 0) + 1);
       continue;
     }
     if (result.stars === row.stars) continue;
 
     if (!row.isPosted) {
-      await db.query(`UPDATE "Message" SET stars = $2, announce = false WHERE "messageId" = $1`, [
-        row.messageId,
-        result.stars,
-      ]);
+      // Correct the count only. This deliberately leaves `announce` alone:
+      // setting it to false here (as this used to) meant that noticing a
+      // message had been missed was itself what disqualified it from ever
+      // being announced, since every other code path refuses to post when
+      // the flag is false. That turned every outage into a permanent loss.
+      await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
       driftedCount++;
       continue;
     }
@@ -330,19 +337,35 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await db.query(`UPDATE "AppState" SET "lastSyncedTs" = $1 WHERE id = 1`, [String(nextCursor)]);
 
   const updateErrors = transientUpdateErrors.length;
+  const lookupErrorBreakdown = [...lookupErrorsByReason.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join(", ");
   await logInfo(
     app.client,
     `Sync job: finished live star check — ${starMismatchCorrected} announcements corrected, ${driftedCount} unposted drifted, ` +
-      `${uneditableCount} un-editable, ${lookupErrors} lookup errors out of ${toCheck.length} checked.`
+      `${uneditableCount} un-editable, ${lookupErrors} lookup errors out of ${toCheck.length} checked` +
+      (lookupErrorBreakdown ? ` (${lookupErrorBreakdown}).` : ".")
   );
 
-  // Rows that are unposted, qualify (>= 5 live stars), and haven't been
-  // explicitly excluded (announce=false is the default outcome of the drift
-  // correction above, but may also have been set by postMissingToThread.js).
+  // `announce` means "may be auto-announced", consistently with
+  // reactionAdd.ts, sendPendingAnnouncements.js, backfillDb.js and
+  // postMissingToThread.js. Rows that qualify (>= 5 live stars), were never
+  // posted, and haven't been held back are genuinely pending.
   const pendingRes = await db.query<DbRow>(
     `SELECT "messageId", "channelId", stars, "postedMessageId" FROM "Message"
+     WHERE announce = true AND stars >= 5 AND ("postedMessageId" IS NULL OR "postedMessageId" = '')`
+  );
+
+  // The mirror image: qualifying rows already held back, either by a previous
+  // over-threshold run or by a bulk backfill / postMissingToThread.js. Counted
+  // for the summary only — they were surfaced when they were held back, and
+  // re-listing them on every run would just be noise.
+  const heldBackRes = await db.query<{ count: string }>(
+    `SELECT count(*) FROM "Message"
      WHERE announce = false AND stars >= 5 AND ("postedMessageId" IS NULL OR "postedMessageId" = '')`
   );
+  const heldBackCount = Number(heldBackRes.rows[0]?.count ?? 0);
   // Held to the same one-year window as the star check above. Outside it the
   // stored star count is no longer reconciled against Slack, so announcing on
   // the strength of it would mean posting an unverified number — and posting a
@@ -353,7 +376,8 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await logInfo(
     app.client,
     `Sync job: found ${pending.length} pending announcements` +
-      (pendingTooOld > 0 ? ` (plus ${pendingTooOld} older than ${MAX_MESSAGE_AGE_DAYS} days, not announced).` : ".")
+      (pendingTooOld > 0 ? ` (plus ${pendingTooOld} older than ${MAX_MESSAGE_AGE_DAYS} days, not announced)` : "") +
+      `, and ${heldBackCount} already held back.`
   );
 
   const nothingFound =
@@ -375,8 +399,12 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- deleted from Slack: ${deletedFromSlack.length}\n` +
     `- star mismatches (corrected): ${starMismatchCorrected}\n` +
     `- update errors (will retry): ${updateErrors}\n` +
-    `- lookup errors: ${lookupErrors}`;
+    `- lookup errors: ${lookupErrors}` +
+    (lookupErrorBreakdown ? ` (${lookupErrorBreakdown})` : "");
 
+  if (heldBackCount > 0) {
+    baseSummary += `\n- previously held back (announce=false), not re-listed: ${heldBackCount}`;
+  }
   if (uneditableCount > 0) {
     baseSummary +=
       `\n- un-editable announcements: ${uneditableCount} (posted by an earlier install of this app; ` +
@@ -390,6 +418,9 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   if (transientUpdateErrors.length > 0) {
     baseSummary += `\n  failed updates: ${transientUpdateErrors.join(", ")}`;
   }
+
+  let summary = baseSummary;
+  const threadSections: Array<{ title: string; lines: string[] }> = [];
 
   if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {
     await logInfo(app.client, `Sync job: auto-sending ${pending.length} pending announcements...`);
@@ -408,29 +439,36 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
       sentLines.push(`${row.stars}⭐ ${link}`);
       await delay(SEND_DELAY_MS);
     }
-
-    await postLog(
-      app.client,
-      `${baseSummary}\n- pending announcements: ${pending.length} (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):\n${sentLines.join("\n")}`,
-      true
-    );
+    summary += `\n- pending announcements: ${pending.length} (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):\n${sentLines.join("\n")}`;
   } else if (pending.length > PENDING_AUTO_SEND_THRESHOLD) {
-    const alertTs = await postLog(
-      app.client,
-      `${baseSummary}\n- pending announcements: ${pending.length} (> ${PENDING_AUTO_SEND_THRESHOLD}, NOT auto-sent — see thread)`,
-      true
-    );
+    // A batch this size means something went wrong (an outage, a long gap in
+    // reaction events) rather than a normal trickle, and dumping it into
+    // #hall-of-fame at once isn't wanted. Record that decision by clearing
+    // `announce`, which holds them back for good — not just for this run, but
+    // against reactionAdd.ts too, so a single new star on a stale message
+    // can't leak one into the channel later. Re-posting any of them is then a
+    // deliberate act: flip the flag back and let sendPendingAnnouncements.js
+    // pick them up.
+    await db.query(`UPDATE "Message" SET announce = false WHERE "messageId" = ANY($1::text[])`, [
+      pending.map((row) => row.messageId),
+    ]);
+    summary += `\n- pending announcements: ${pending.length} (> ${PENDING_AUTO_SEND_THRESHOLD}, NOT posted — held back, see thread)`;
+    threadSections.push({
+      title: `Held back — too many to post at once (${pending.length} > ${PENDING_AUTO_SEND_THRESHOLD}). Not posted, and won't be unless you flip announce back:`,
+      lines: pending.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
+    });
+  }
 
-    if (alertTs) {
-      const lines = pending.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`);
-      for (let i = 0; i < lines.length; i += THREAD_CHUNK_SIZE) {
-        const chunk = lines.slice(i, i + THREAD_CHUNK_SIZE).join("\n");
-        await app.client.chat.postMessage({ channel: LOG_CHANNEL, thread_ts: alertTs, text: chunk });
-        await delay(SEND_DELAY_MS);
-      }
+  const alertTs = await postLog(app.client, summary, true);
+  if (!alertTs) return;
+
+  for (const section of threadSections) {
+    for (let i = 0; i < section.lines.length; i += THREAD_CHUNK_SIZE) {
+      const chunk = section.lines.slice(i, i + THREAD_CHUNK_SIZE).join("\n");
+      const header = i === 0 ? `*${section.title}*\n` : "";
+      await app.client.chat.postMessage({ channel: LOG_CHANNEL, thread_ts: alertTs, text: `${header}${chunk}` });
+      await delay(SEND_DELAY_MS);
     }
-  } else {
-    await postLog(app.client, baseSummary, true);
   }
 }
 
