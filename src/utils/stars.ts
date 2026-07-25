@@ -18,3 +18,11 @@ export async function getLiveStarCount(
     return { ok: false };
   }
 }
+
+// The `error` string Slack returns in a failed API response body, e.g.
+// "cant_update_message". Bolt's WebClient throws a WebAPIPlatformError that
+// carries the whole response under `.data`.
+export function slackErrorCode(err: unknown): string | undefined {
+  const data = (err as { data?: { error?: unknown } } | undefined)?.data;
+  return typeof data?.error === "string" ? data.error : undefined;
+}

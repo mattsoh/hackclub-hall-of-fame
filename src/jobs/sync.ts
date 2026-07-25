@@ -2,7 +2,7 @@ import { App } from "@slack/bolt";
 import { Client } from "pg";
 import { withPgClient } from "../utils/pg";
 import { logError, logInfo, postLog, LOG_CHANNEL } from "../utils/log";
-import { getLiveStarCount } from "../utils/stars";
+import { getLiveStarCount, slackErrorCode } from "../utils/stars";
 
 const HALL_OF_FAME_CHANNEL = "C028VGT0JMQ";
 // Matched by name, not bot_id: the app's bot_id changed at least once (an app
@@ -10,13 +10,41 @@ const HALL_OF_FAME_CHANNEL = "C028VGT0JMQ";
 const HALL_OF_FAME_BOT_NAME = "Hall of Fame";
 const STAR_LINE = /^(?:⭐|:star:) \*(\d+)\*/;
 const PERMALINK = /archives\/([A-Z0-9]+)\/p(\d+)/;
-const REACTION_CALL_DELAY_MS = 200;
+
+// reactions.get is a Slack Tier 3 method: ~50 requests per minute. Pacing at
+// 1250ms keeps us just under that ceiling. The previous 200ms delay drove
+// ~300 requests/minute, so every run spent most of its time in Bolt's 429
+// backoff (10s per rejected call) and made no faster progress than this does
+// — it just produced a wall of rate-limit warnings while doing so.
+const REACTION_CALL_DELAY_MS = 1250;
+// conversations.history is Tier 3 as well, but only runs ~40 times per sync.
+const HISTORY_CALL_DELAY_MS = 1250;
+// chat.postMessage is limited to roughly one message per second per channel.
 const SEND_DELAY_MS = 1200;
+
+// Hard ceiling on reactions.get calls per run. At the pacing above this caps a
+// run at ~25 minutes. There are thousands of tracked messages and no bulk
+// reaction API, so a single run cannot cover all of them without running for
+// hours; instead each run checks everything recent plus a rotating slice of
+// the backlog (see selectRowsToCheck).
+const MAX_REACTION_CALLS_PER_RUN = 1200;
+// Messages younger than this are checked on every run — practically all star
+// activity happens here. Older ones are reconciled by rotation.
+const RECENT_WINDOW_DAYS = 30;
+
 const PENDING_AUTO_SEND_THRESHOLD = 10;
 const THREAD_CHUNK_SIZE = 40;
+const ERROR_SAMPLE_SIZE = 10;
+
+// Slack errors that will never succeed on a retry: the announcement was
+// authored by a different app installation, or it no longer exists. Retrying
+// these every run just burns API calls and pings a human for something no
+// amount of retrying can fix.
+const PERMANENT_UPDATE_ERRORS = new Set(["cant_update_message", "message_not_found", "channel_not_found"]);
 
 interface SlackPost {
   stars: number;
+  botId?: string;
   originChannel?: string;
   originTs?: string;
 }
@@ -26,6 +54,10 @@ interface DbRow {
   channelId: string;
   stars: number;
   postedMessageId: string | null;
+}
+
+interface ScanRow extends DbRow {
+  isPosted: boolean;
 }
 
 function parsePermalink(text: string): { channel: string; ts: string } | null {
@@ -40,8 +72,26 @@ function originLink(channel: string, ts: string): string {
   return `https://hackclub.slack.com/archives/${channel}/p${ts.replace(".", "")}`;
 }
 
+// Slack timestamps are "<unix seconds>.<microseconds>".
+function tsSeconds(ts: string | null | undefined): number {
+  return Number((ts ?? "").split(".")[0]) || 0;
+}
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// The bot_id the current token posts under. Announcements posted by an earlier
+// installation of the app carry a different bot_id and cannot be edited with
+// this token — Slack rejects those chat.update calls with cant_update_message.
+async function fetchOwnBotId(app: App): Promise<string | undefined> {
+  try {
+    const res = await app.client.auth.test();
+    return typeof res.bot_id === "string" ? res.bot_id : undefined;
+  } catch (err) {
+    await logError(app.client, "Sync job: could not resolve own bot_id (assuming all announcements editable)", err);
+    return undefined;
+  }
 }
 
 async function fetchHallOfFameHistory(app: App): Promise<Map<string, SlackPost>> {
@@ -56,6 +106,7 @@ async function fetchHallOfFameHistory(app: App): Promise<Map<string, SlackPost>>
     });
     messages.push(...((res.messages as Record<string, any>[]) ?? []));
     cursor = res.response_metadata?.next_cursor;
+    if (cursor) await delay(HISTORY_CALL_DELAY_MS);
   } while (cursor);
 
   const posts = new Map<string, SlackPost>();
@@ -67,6 +118,7 @@ async function fetchHallOfFameHistory(app: App): Promise<Map<string, SlackPost>>
     const origin = parsePermalink(message.text);
     posts.set(message.ts, {
       stars: Number(match[1]),
+      botId: message.bot_id as string,
       originChannel: origin?.channel,
       originTs: origin?.ts,
     });
@@ -74,8 +126,40 @@ async function fetchHallOfFameHistory(app: App): Promise<Map<string, SlackPost>>
   return posts;
 }
 
+// Everything within RECENT_WINDOW_DAYS, plus as much of the older backlog as
+// the per-run budget allows, resuming from where the last run stopped so the
+// whole backlog is covered over successive runs.
+function selectRowsToCheck(
+  rows: ScanRow[],
+  cursor: number
+): { toCheck: ScanRow[]; nextCursor: number; olderTotal: number } {
+  const recentCutoff = Math.floor(Date.now() / 1000) - RECENT_WINDOW_DAYS * 24 * 60 * 60;
+
+  const recent = rows.filter((r) => tsSeconds(r.messageId) >= recentCutoff);
+  const older = rows
+    .filter((r) => tsSeconds(r.messageId) < recentCutoff)
+    .sort((a, b) => tsSeconds(a.messageId) - tsSeconds(b.messageId));
+
+  // Resume just past the cursor; when the cursor is at (or past) the end,
+  // findIndex returns -1 and the scan wraps around to the oldest row.
+  const resumeAt = older.findIndex((r) => tsSeconds(r.messageId) > cursor);
+  const rotated = resumeAt === -1 ? older : [...older.slice(resumeAt), ...older.slice(0, resumeAt)];
+
+  const olderBudget = Math.max(0, MAX_REACTION_CALLS_PER_RUN - recent.length);
+  const olderSlice = rotated.slice(0, olderBudget);
+  const last = olderSlice[olderSlice.length - 1];
+
+  return {
+    toCheck: [...recent, ...olderSlice],
+    nextCursor: last ? tsSeconds(last.messageId) : cursor,
+    olderTotal: older.length,
+  };
+}
+
 async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await logInfo(app.client, "Starting sync job...");
+
+  const ownBotId = await fetchOwnBotId(app);
 
   await logInfo(app.client, "Sync job: fetching #hall-of-fame history from Slack...");
   const slackPosts = await fetchHallOfFameHistory(app);
@@ -130,59 +214,115 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     await logInfo(app.client, `Sync job: backfilled ${backfilledCount} messages into DB.`);
   }
 
-  // Check every posted message directly against the LIVE reaction count on
-  // its origin message. Slack's reaction state is the only source of truth —
-  // comparing the DB to the announcement's displayed text (as this used to
-  // do) can't catch the case where both are stale together, e.g. because a
-  // reaction event was missed or arrived before the message was posted.
-  await logInfo(app.client, `Sync job: checking live star counts for ${postedRes.rows.length} posted messages...`);
-  let starMismatchCorrected = 0;
-  let postedLookupErrors = 0;
-  let updateErrors = 0;
-  for (const row of postedRes.rows) {
-    const result = await getLiveStarCount(app.client, row.channelId, row.messageId);
-    if (!result.ok) {
-      postedLookupErrors++;
-    } else if (result.stars !== row.stars) {
-      await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
-
-      const text = `⭐ *${result.stars}*\n${originLink(row.channelId, row.messageId)}`;
-      try {
-        await app.client.chat.update({ channel: HALL_OF_FAME_CHANNEL, ts: row.postedMessageId as string, text });
-        starMismatchCorrected++;
-      } catch (err) {
-        updateErrors++;
-        await logError(app.client, `Sync job: failed to update posted message ${row.postedMessageId}`, err);
-      }
-    }
-    await delay(REACTION_CALL_DELAY_MS);
-  }
-  if (starMismatchCorrected > 0) {
-    await logInfo(app.client, `Sync job: corrected ${starMismatchCorrected} star mismatches.`);
-  }
-
-  // Check every currently-unposted row against its live Slack star count.
   const unpostedRes = await db.query<DbRow>(
     `SELECT "messageId", "channelId", stars, "postedMessageId" FROM "Message"
      WHERE "postedMessageId" IS NULL OR "postedMessageId" = ''`
   );
-  await logInfo(app.client, `Sync job: checking live star counts for ${unpostedRes.rows.length} unposted messages...`);
 
-  let driftedCount = 0;
-  let lookupErrors = 0;
-  for (const row of unpostedRes.rows) {
-    const result = await getLiveStarCount(app.client, row.channelId, row.messageId);
-    if (!result.ok) {
-      lookupErrors++;
-    } else if (result.stars !== row.stars) {
-      await db.query(`UPDATE "Message" SET stars = $2, announce = false WHERE "messageId" = $1`, [row.messageId, result.stars]);
-      driftedCount++;
-    }
-    await delay(REACTION_CALL_DELAY_MS);
-  }
+  const cursorRes = await db.query<{ lastSyncedTs: string | null }>(
+    `SELECT "lastSyncedTs" FROM "AppState" WHERE id = 1`
+  );
+  const cursor = Number(cursorRes.rows[0]?.lastSyncedTs) || 0;
+
+  // Check tracked messages directly against the LIVE reaction count on the
+  // origin message. Slack's reaction state is the only source of truth —
+  // comparing the DB to the announcement's displayed text (as this used to
+  // do) can't catch the case where both are stale together, e.g. because a
+  // reaction event was missed or arrived before the message was posted.
+  const scanRows: ScanRow[] = [
+    ...postedRes.rows.map((r) => ({ ...r, isPosted: true })),
+    ...unpostedRes.rows.map((r) => ({ ...r, isPosted: false })),
+  ];
+  const { toCheck, nextCursor, olderTotal } = selectRowsToCheck(scanRows, cursor);
+
   await logInfo(
     app.client,
-    `Sync job: finished live star check — ${driftedCount} drifted, ${lookupErrors} lookup errors out of ${unpostedRes.rows.length}.`
+    `Sync job: checking live star counts for ${toCheck.length} of ${scanRows.length} tracked messages ` +
+      `(everything from the last ${RECENT_WINDOW_DAYS} days, plus a rotating slice of the ${olderTotal} older ones).`
+  );
+
+  let starMismatchCorrected = 0;
+  let driftedCount = 0;
+  let lookupErrors = 0;
+  let uneditableCount = 0;
+  let deletedAnnouncementCount = 0;
+  const transientUpdateErrors: string[] = [];
+  const uneditableSamples: string[] = [];
+
+  for (const row of toCheck) {
+    const result = await getLiveStarCount(app.client, row.channelId, row.messageId);
+    await delay(REACTION_CALL_DELAY_MS);
+
+    if (!result.ok) {
+      lookupErrors++;
+      continue;
+    }
+    if (result.stars === row.stars) continue;
+
+    if (!row.isPosted) {
+      await db.query(`UPDATE "Message" SET stars = $2, announce = false WHERE "messageId" = $1`, [
+        row.messageId,
+        result.stars,
+      ]);
+      driftedCount++;
+      continue;
+    }
+
+    const postedTs = row.postedMessageId as string;
+    const announcement = slackPosts.get(postedTs);
+    const link = originLink(row.channelId, row.messageId);
+
+    // The announcement is gone from #hall-of-fame — already reported under
+    // "deleted from Slack". Keep the DB honest about the live count, but
+    // don't spend a chat.update that can only fail.
+    if (!announcement) {
+      await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
+      deletedAnnouncementCount++;
+      continue;
+    }
+
+    // Posted by a previous installation of the app: Slack will not let this
+    // token edit it, so the displayed star count is frozen for good. Record
+    // the true count in the DB and report the announcement once rather than
+    // failing on it every single run.
+    if (ownBotId && announcement.botId && announcement.botId !== ownBotId) {
+      await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
+      uneditableCount++;
+      if (uneditableSamples.length < ERROR_SAMPLE_SIZE) uneditableSamples.push(link);
+      continue;
+    }
+
+    const text = `⭐ *${result.stars}*\n${link}`;
+    try {
+      await app.client.chat.update({ channel: HALL_OF_FAME_CHANNEL, ts: postedTs, text });
+      await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
+      starMismatchCorrected++;
+    } catch (err) {
+      const code = slackErrorCode(err);
+      if (code && PERMANENT_UPDATE_ERRORS.has(code)) {
+        // Same situation as the bot_id check above, reached when bot_id alone
+        // couldn't tell us (e.g. auth.test failed). Not retryable.
+        await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
+        uneditableCount++;
+        if (uneditableSamples.length < ERROR_SAMPLE_SIZE) uneditableSamples.push(`${link} (${code})`);
+      } else {
+        // Transient (rate limit, network, Slack outage). Deliberately leave
+        // the DB stale so the next run sees the mismatch again and retries —
+        // writing it here would hide the drift permanently.
+        if (transientUpdateErrors.length < ERROR_SAMPLE_SIZE) {
+          transientUpdateErrors.push(`${link} (${code ?? "unknown error"})`);
+        }
+      }
+    }
+  }
+
+  await db.query(`UPDATE "AppState" SET "lastSyncedTs" = $1 WHERE id = 1`, [String(nextCursor)]);
+
+  const updateErrors = transientUpdateErrors.length;
+  await logInfo(
+    app.client,
+    `Sync job: finished live star check — ${starMismatchCorrected} announcements corrected, ${driftedCount} unposted drifted, ` +
+      `${uneditableCount} un-editable, ${lookupErrors} lookup errors out of ${toCheck.length} checked.`
   );
 
   // Rows that are unposted, qualify (>= 5 live stars), and haven't been
@@ -200,6 +340,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     deletedFromSlack.length === 0 &&
     starMismatchCorrected === 0 &&
     updateErrors === 0 &&
+    uneditableCount === 0 &&
     pending.length === 0;
 
   if (nothingFound) {
@@ -207,13 +348,27 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     return;
   }
 
-  const baseSummary =
+  let baseSummary =
     `Sync job found issues:\n` +
     `- missing from DB (backfilled): ${backfilledCount}\n` +
     `- deleted from Slack: ${deletedFromSlack.length}\n` +
     `- star mismatches (corrected): ${starMismatchCorrected}\n` +
-    `- update errors: ${updateErrors}\n` +
-    `- lookup errors: ${postedLookupErrors + lookupErrors}`;
+    `- update errors (will retry): ${updateErrors}\n` +
+    `- lookup errors: ${lookupErrors}`;
+
+  if (uneditableCount > 0) {
+    baseSummary +=
+      `\n- un-editable announcements: ${uneditableCount} (posted by an earlier install of this app; ` +
+      `DB star counts corrected, but the messages in #hall-of-fame stay stale — they can only be fixed by ` +
+      `deleting and reposting them)`;
+    baseSummary += `\n  e.g. ${uneditableSamples.join(", ")}`;
+  }
+  if (deletedAnnouncementCount > 0) {
+    baseSummary += `\n- stale counts on deleted announcements (DB corrected): ${deletedAnnouncementCount}`;
+  }
+  if (transientUpdateErrors.length > 0) {
+    baseSummary += `\n  failed updates: ${transientUpdateErrors.join(", ")}`;
+  }
 
   if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {
     await logInfo(app.client, `Sync job: auto-sending ${pending.length} pending announcements...`);
@@ -250,6 +405,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
       for (let i = 0; i < lines.length; i += THREAD_CHUNK_SIZE) {
         const chunk = lines.slice(i, i + THREAD_CHUNK_SIZE).join("\n");
         await app.client.chat.postMessage({ channel: LOG_CHANNEL, thread_ts: alertTs, text: chunk });
+        await delay(SEND_DELAY_MS);
       }
     }
   } else {
@@ -257,10 +413,23 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   }
 }
 
+// A run can take tens of minutes. The job fires on every server start as well
+// as on a timer, so without this guard a restart mid-run (or a slow run
+// overrunning its interval) would put two scans on the same data at once and
+// double the API pressure that this job is already constrained by.
+let syncRunning = false;
+
 export async function runSyncJob(app: App): Promise<void> {
+  if (syncRunning) {
+    await logInfo(app.client, "Sync job: previous run still in progress, skipping this one.");
+    return;
+  }
+  syncRunning = true;
   try {
     await withPgClient((db) => runSyncJobBody(app, db));
   } catch (err) {
     await logError(app.client, "Sync job failed", err);
+  } finally {
+    syncRunning = false;
   }
 }
