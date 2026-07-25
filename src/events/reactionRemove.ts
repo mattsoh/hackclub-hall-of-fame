@@ -1,5 +1,6 @@
 import { App, ReactionMessageItem } from "@slack/bolt";
 import prisma from "../utils/prisma";
+import { getLiveStarCount } from "../utils/stars";
 
 const reactionRemoveEvent = async (app: App): Promise<void> => {
   app.event("reaction_removed", async ({ event, client }) => {
@@ -15,21 +16,22 @@ const reactionRemoveEvent = async (app: App): Promise<void> => {
 
     if (entry === null) return;
 
-    // Remove a star, if one can be removed
-    if (entry.stars >= 1) {
-      entry = await prisma.message.update(
-        {
-          where: {
-            messageId: event.item["ts"],
-          },
-          data: {
-            stars: entry.stars - 1,
-          }
-        }
-      );
+    const liveCount = await getLiveStarCount(client, event.item["channel"], event.item["ts"]);
+    if (!liveCount.ok) return;
 
-      await prisma.appState.update({ where: { id: 1 }, data: { starsDecreased: { increment: 1 } } });
-    }
+    // Set the star count to Slack's live count — the only source of truth.
+    entry = await prisma.message.update(
+      {
+        where: {
+          messageId: event.item["ts"],
+        },
+        data: {
+          stars: liveCount.stars,
+        }
+      }
+    );
+
+    await prisma.appState.update({ where: { id: 1 }, data: { starsDecreased: { increment: 1 } } });
 
     if (entry.postedMessageId && entry.stars < 5) {
       await client.chat.delete({
