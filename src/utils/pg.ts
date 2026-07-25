@@ -1,4 +1,5 @@
 import { Client } from "pg";
+import * as tls from "tls";
 
 // The server's TLS cert is issued for the external tier2 hostname, but in
 // production DATABASE_URL points at the internal Kubernetes service DNS name
@@ -20,7 +21,15 @@ export async function withPgClient<T>(fn: (client: Client) => Promise<T>): Promi
   dbUrl.search = "";
   const client = new Client({
     connectionString: dbUrl.toString(),
-    ssl: { rejectUnauthorized: true, servername: CERT_SERVERNAME },
+    // pg's connection.js unconditionally overwrites ssl.servername with the
+    // connection host right before the TLS handshake (see
+    // node_modules/pg/lib/connection.js), clobbering any override here — so
+    // the SNI/cert-name mismatch has to be fixed via checkServerIdentity
+    // instead, which pg does not touch.
+    ssl: {
+      rejectUnauthorized: true,
+      checkServerIdentity: (_hostname, cert) => tls.checkServerIdentity(CERT_SERVERNAME, cert),
+    },
   });
   await client.connect();
   try {
