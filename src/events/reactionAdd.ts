@@ -23,6 +23,8 @@ const reactionAddEvent = async (app: App): Promise<void> => {
         }
       });
 
+      await prisma.appState.update({ where: { id: 1 }, data: { starsIncreased: { increment: 1 } } });
+
       return;
     }
 
@@ -37,6 +39,8 @@ const reactionAddEvent = async (app: App): Promise<void> => {
         }
       }
     );
+
+    await prisma.appState.update({ where: { id: 1 }, data: { starsIncreased: { increment: 1 } } });
 
     if (entry.stars >= 5) {
       const recentEntries = await prisma.message.findMany({
@@ -100,6 +104,8 @@ const reactionAddEvent = async (app: App): Promise<void> => {
             }
           }
         );
+
+        await prisma.appState.update({ where: { id: 1 }, data: { newPosts: { increment: 1 } } });
       }
       // else: announce === false means this entry was deliberately excluded
       // (backfilled historical data, or already surfaced via a review thread)

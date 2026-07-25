@@ -27,6 +27,8 @@ const reactionRemoveEvent = async (app: App): Promise<void> => {
           }
         }
       );
+
+      await prisma.appState.update({ where: { id: 1 }, data: { starsDecreased: { increment: 1 } } });
     }
 
     if (entry.postedMessageId && entry.stars < 5) {

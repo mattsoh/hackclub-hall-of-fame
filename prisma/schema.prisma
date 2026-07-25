@@ -20,3 +20,14 @@ model Message {
   postedMessageId String?
   announce        Boolean @default(true)
 }
+
+// Singleton row (id always 1) holding operational bookkeeping: sync cursor and
+// counters for the daily overview report.
+model AppState {
+  id               Int      @id
+  lastSyncedTs     String?
+  statsWindowStart DateTime @default(now())
+  starsIncreased   Int      @default(0)
+  starsDecreased   Int      @default(0)
+  newPosts         Int      @default(0)
+}
