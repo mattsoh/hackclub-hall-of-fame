@@ -357,14 +357,15 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
      WHERE announce = true AND stars >= 5 AND ("postedMessageId" IS NULL OR "postedMessageId" = '')`
   );
 
-  // The mirror image: qualifying rows that were deliberately held back, by a
-  // bulk backfill or by postMissingToThread.js. These are never auto-sent —
-  // they're surfaced in a thread so they can be triaged by hand.
-  const excludedRes = await db.query<DbRow>(
-    `SELECT "messageId", "channelId", stars, "postedMessageId" FROM "Message"
+  // The mirror image: qualifying rows already held back, either by a previous
+  // over-threshold run or by a bulk backfill / postMissingToThread.js. Counted
+  // for the summary only — they were surfaced when they were held back, and
+  // re-listing them on every run would just be noise.
+  const heldBackRes = await db.query<{ count: string }>(
+    `SELECT count(*) FROM "Message"
      WHERE announce = false AND stars >= 5 AND ("postedMessageId" IS NULL OR "postedMessageId" = '')`
   );
-  const excluded = excludedRes.rows.sort((a, b) => tsSeconds(b.messageId) - tsSeconds(a.messageId));
+  const heldBackCount = Number(heldBackRes.rows[0]?.count ?? 0);
   // Held to the same one-year window as the star check above. Outside it the
   // stored star count is no longer reconciled against Slack, so announcing on
   // the strength of it would mean posting an unverified number — and posting a
@@ -376,7 +377,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     app.client,
     `Sync job: found ${pending.length} pending announcements` +
       (pendingTooOld > 0 ? ` (plus ${pendingTooOld} older than ${MAX_MESSAGE_AGE_DAYS} days, not announced)` : "") +
-      `, and ${excluded.length} held back (announce=false, never auto-sent).`
+      `, and ${heldBackCount} already held back.`
   );
 
   const nothingFound =
@@ -401,9 +402,8 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- lookup errors: ${lookupErrors}` +
     (lookupErrorBreakdown ? ` (${lookupErrorBreakdown})` : "");
 
-  if (excluded.length > 0) {
-    baseSummary +=
-      `\n- held back (announce=false), never auto-sent: ${excluded.length} — listed in thread for triage`;
+  if (heldBackCount > 0) {
+    baseSummary += `\n- previously held back (announce=false), not re-listed: ${heldBackCount}`;
   }
   if (uneditableCount > 0) {
     baseSummary +=
@@ -441,17 +441,21 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     }
     summary += `\n- pending announcements: ${pending.length} (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):\n${sentLines.join("\n")}`;
   } else if (pending.length > PENDING_AUTO_SEND_THRESHOLD) {
-    summary += `\n- pending announcements: ${pending.length} (> ${PENDING_AUTO_SEND_THRESHOLD}, NOT auto-sent — see thread)`;
+    // A batch this size means something went wrong (an outage, a long gap in
+    // reaction events) rather than a normal trickle, and dumping it into
+    // #hall-of-fame at once isn't wanted. Record that decision by clearing
+    // `announce`, which holds them back for good — not just for this run, but
+    // against reactionAdd.ts too, so a single new star on a stale message
+    // can't leak one into the channel later. Re-posting any of them is then a
+    // deliberate act: flip the flag back and let sendPendingAnnouncements.js
+    // pick them up.
+    await db.query(`UPDATE "Message" SET announce = false WHERE "messageId" = ANY($1::text[])`, [
+      pending.map((row) => row.messageId),
+    ]);
+    summary += `\n- pending announcements: ${pending.length} (> ${PENDING_AUTO_SEND_THRESHOLD}, NOT posted — held back, see thread)`;
     threadSections.push({
-      title: `Pending (eligible, over the auto-send threshold of ${PENDING_AUTO_SEND_THRESHOLD}):`,
+      title: `Held back — too many to post at once (${pending.length} > ${PENDING_AUTO_SEND_THRESHOLD}). Not posted, and won't be unless you flip announce back:`,
       lines: pending.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
-    });
-  }
-
-  if (excluded.length > 0) {
-    threadSections.push({
-      title: `Held back (announce=false) — not posted, triage by hand:`,
-      lines: excluded.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
     });
   }
 
