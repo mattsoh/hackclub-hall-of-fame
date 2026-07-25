@@ -38,6 +38,10 @@ const RECENT_WINDOW_DAYS = 30;
 const MAX_MESSAGE_AGE_DAYS = 365;
 
 const PENDING_AUTO_SEND_THRESHOLD = 10;
+// When the pending batch is over the threshold, anything this recent is still
+// sent rather than held back — a message from the last day is current enough
+// that the bot being briefly down shouldn't cost it its announcement.
+const SEND_CATCHUP_WINDOW_HOURS = 24;
 const THREAD_CHUNK_SIZE = 40;
 const ERROR_SAMPLE_SIZE = 10;
 
@@ -448,10 +452,35 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   let summary = baseSummary;
   const threadSections: Array<{ title: string; lines: string[] }> = [];
 
-  if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {
-    await logInfo(app.client, `Sync job: auto-sending ${pending.length} pending announcements...`);
+  // An over-threshold batch means something went wrong — an outage, or a long
+  // gap in reaction events — rather than a normal trickle, and replaying all
+  // of it into #hall-of-fame at once isn't wanted. But losing the recent end
+  // of it isn't either: those messages are still current and would have been
+  // posted individually had the bot been up. So the newest
+  // PENDING_AUTO_SEND_THRESHOLD still go out, along with anything from the
+  // last SEND_CATCHUP_WINDOW_HOURS however many that is, and only the older
+  // remainder is held back.
+  const newestFirst = [...pending].sort((a, b) => tsSeconds(b.messageId) - tsSeconds(a.messageId));
+  let toSend = newestFirst;
+  let toHold: DbRow[] = [];
+
+  if (pending.length > PENDING_AUTO_SEND_THRESHOLD) {
+    const catchupCutoff = Math.floor(Date.now() / 1000) - SEND_CATCHUP_WINDOW_HOURS * 60 * 60;
+    const sending = new Set(newestFirst.slice(0, PENDING_AUTO_SEND_THRESHOLD).map((r) => r.messageId));
+    for (const row of newestFirst) {
+      if (tsSeconds(row.messageId) >= catchupCutoff) sending.add(row.messageId);
+    }
+    toSend = newestFirst.filter((r) => sending.has(r.messageId));
+    toHold = newestFirst.filter((r) => !sending.has(r.messageId));
+  }
+
+  // Post oldest-first so the channel reads chronologically.
+  const sendOrder = [...toSend].reverse();
+
+  if (sendOrder.length > 0) {
+    await logInfo(app.client, `Sync job: auto-sending ${sendOrder.length} pending announcements...`);
     const sentLines: string[] = [];
-    for (const row of pending) {
+    for (const row of sendOrder) {
       const link = originLink(row.channelId, row.messageId);
       const text = `⭐ *${row.stars}*\n${link}`;
       const posted = await app.client.chat.postMessage({ channel: HALL_OF_FAME_CHANNEL, text });
@@ -465,23 +494,28 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
       sentLines.push(`${row.stars}⭐ ${link}`);
       await delay(SEND_DELAY_MS);
     }
-    summary += `\n- pending announcements: ${pending.length} (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):\n${sentLines.join("\n")}`;
-  } else if (pending.length > PENDING_AUTO_SEND_THRESHOLD) {
-    // A batch this size means something went wrong (an outage, a long gap in
-    // reaction events) rather than a normal trickle, and dumping it into
-    // #hall-of-fame at once isn't wanted. Record that decision by clearing
-    // `announce`, which holds them back for good — not just for this run, but
-    // against reactionAdd.ts too, so a single new star on a stale message
-    // can't leak one into the channel later. Re-posting any of them is then a
-    // deliberate act: flip the flag back and let sendPendingAnnouncements.js
-    // pick them up.
+    summary +=
+      `\n- pending announcements: ${pending.length}` +
+      (toHold.length > 0
+        ? ` (> ${PENDING_AUTO_SEND_THRESHOLD}; sent the newest ${PENDING_AUTO_SEND_THRESHOLD} plus everything from the last ${SEND_CATCHUP_WINDOW_HOURS}h — ${sendOrder.length} in all):`
+        : ` (<= ${PENDING_AUTO_SEND_THRESHOLD}, sent automatically):`) +
+      `\n${sentLines.join("\n")}`;
+  }
+
+  if (toHold.length > 0) {
+    // Clearing `announce` records the decision not to post these. Because
+    // every posting path refuses on a false flag, it holds them back for good
+    // — not just for this run, but against reactionAdd.ts too, so a single new
+    // star on a stale message can't leak one into the channel later. Reposting
+    // is then a deliberate act: flip the flag back and let
+    // sendPendingAnnouncements.js pick them up.
     await db.query(`UPDATE "Message" SET announce = false WHERE "messageId" = ANY($1::text[])`, [
-      pending.map((row) => row.messageId),
+      toHold.map((row) => row.messageId),
     ]);
-    summary += `\n- pending announcements: ${pending.length} (> ${PENDING_AUTO_SEND_THRESHOLD}, NOT posted — held back, see thread)`;
+    summary += `\n- held back (older backlog, not posted): ${toHold.length} — see thread`;
     threadSections.push({
-      title: `Held back — too many to post at once (${pending.length} > ${PENDING_AUTO_SEND_THRESHOLD}). Not posted, and won't be unless you flip announce back:`,
-      lines: pending.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
+      title: `Held back — older than the last ${SEND_CATCHUP_WINDOW_HOURS}h and outside the newest ${PENDING_AUTO_SEND_THRESHOLD}. Not posted, and won't be unless you flip announce back:`,
+      lines: toHold.map((row) => `${row.stars}⭐ ${originLink(row.channelId, row.messageId)}`),
     });
   }
 
