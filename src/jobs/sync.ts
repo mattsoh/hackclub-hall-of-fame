@@ -100,13 +100,13 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await logInfo(app.client, `Sync job: loaded ${postedRes.rows.length} posted messages from DB.`);
 
   const missingFromDb: Array<{ postedTs: string } & SlackPost> = [];
-  const starMismatches: Array<{ postedTs: string; messageId: string; slackStars: number; dbStars: number }> = [];
+  const starMismatches: Array<{ postedTs: string; messageId: string; channelId: string; slackStars: number; dbStars: number }> = [];
   for (const [ts, post] of slackPosts) {
     const dbPost = dbPostedByPostedId.get(ts);
     if (!dbPost) {
       missingFromDb.push({ postedTs: ts, ...post });
     } else if (dbPost.stars !== post.stars) {
-      starMismatches.push({ postedTs: ts, messageId: dbPost.messageId, slackStars: post.stars, dbStars: dbPost.stars });
+      starMismatches.push({ postedTs: ts, messageId: dbPost.messageId, channelId: dbPost.channelId, slackStars: post.stars, dbStars: dbPost.stars });
     }
   }
 
@@ -142,6 +142,31 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   }
   if (backfilledCount > 0) {
     await logInfo(app.client, `Sync job: backfilled ${backfilledCount} messages into DB.`);
+  }
+
+  // Correct star mismatches on already-posted messages. The mismatch check
+  // above only compares DB vs the announcement's displayed text — but that
+  // text can itself be stale if a live reaction event was missed after the
+  // last edit. So correct against the LIVE reaction count on the origin
+  // message (source of truth), fixing both the DB and the posted message.
+  if (starMismatches.length > 0) {
+    await logInfo(app.client, `Sync job: correcting ${starMismatches.length} star mismatches...`);
+  }
+  let starMismatchCorrected = 0;
+  for (const row of starMismatches) {
+    const result = await getLiveStarCount(app, row.channelId, row.messageId);
+    const correctStars = result.ok ? result.stars : row.slackStars;
+
+    await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, correctStars]);
+
+    const text = `⭐ *${correctStars}*\n${originLink(row.channelId, row.messageId)}`;
+    await app.client.chat.update({ channel: HALL_OF_FAME_CHANNEL, ts: row.postedTs, text });
+
+    starMismatchCorrected++;
+    await delay(REACTION_CALL_DELAY_MS);
+  }
+  if (starMismatchCorrected > 0) {
+    await logInfo(app.client, `Sync job: corrected ${starMismatchCorrected} star mismatches.`);
   }
 
   // Check every currently-unposted row against its live Slack star count.
@@ -190,7 +215,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `Sync job found issues:\n` +
     `- missing from DB (backfilled): ${backfilledCount}\n` +
     `- deleted from Slack: ${deletedFromSlack.length}\n` +
-    `- star mismatches: ${starMismatches.length}\n` +
+    `- star mismatches (corrected): ${starMismatchCorrected}\n` +
     `- lookup errors: ${lookupErrors}`;
 
   if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {

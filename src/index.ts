@@ -2,7 +2,7 @@ import * as dotenv from "dotenv";
 import { App, ExpressReceiver } from "@slack/bolt";
 import * as events from "./events/index";
 import prisma from "./utils/prisma";
-import { logError } from "./utils/log";
+import { logError, postLog } from "./utils/log";
 import { runSyncJob } from "./jobs/sync";
 import { runDailyOverview } from "./jobs/dailyOverview";
 
@@ -56,6 +56,7 @@ expressReceiver.app.get("/status", (req, res) => {
 (async (): Promise<void> => {
   await app.start(Number(process.env.PORT) || 3000);
   console.log("Server started!");
+  await postLog(app.client, "Server (re)started.", true);
 
   // credits to Rishi (https://github.com/rishiosaur) for this
   for (const [event, handler] of Object.entries(events)) {
