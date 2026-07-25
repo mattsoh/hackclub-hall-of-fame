@@ -138,6 +138,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await logInfo(app.client, `Sync job: checking live star counts for ${postedRes.rows.length} posted messages...`);
   let starMismatchCorrected = 0;
   let postedLookupErrors = 0;
+  let updateErrors = 0;
   for (const row of postedRes.rows) {
     const result = await getLiveStarCount(app.client, row.channelId, row.messageId);
     if (!result.ok) {
@@ -146,9 +147,13 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
       await db.query(`UPDATE "Message" SET stars = $2 WHERE "messageId" = $1`, [row.messageId, result.stars]);
 
       const text = `⭐ *${result.stars}*\n${originLink(row.channelId, row.messageId)}`;
-      await app.client.chat.update({ channel: HALL_OF_FAME_CHANNEL, ts: row.postedMessageId as string, text });
-
-      starMismatchCorrected++;
+      try {
+        await app.client.chat.update({ channel: HALL_OF_FAME_CHANNEL, ts: row.postedMessageId as string, text });
+        starMismatchCorrected++;
+      } catch (err) {
+        updateErrors++;
+        await logError(app.client, `Sync job: failed to update posted message ${row.postedMessageId}`, err);
+      }
     }
     await delay(REACTION_CALL_DELAY_MS);
   }
@@ -191,7 +196,11 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await logInfo(app.client, `Sync job: found ${pending.length} pending announcements.`);
 
   const nothingFound =
-    backfilledCount === 0 && deletedFromSlack.length === 0 && starMismatchCorrected === 0 && pending.length === 0;
+    backfilledCount === 0 &&
+    deletedFromSlack.length === 0 &&
+    starMismatchCorrected === 0 &&
+    updateErrors === 0 &&
+    pending.length === 0;
 
   if (nothingFound) {
     await logInfo(app.client, "Sync job: no issues found.");
@@ -203,6 +212,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- missing from DB (backfilled): ${backfilledCount}\n` +
     `- deleted from Slack: ${deletedFromSlack.length}\n` +
     `- star mismatches (corrected): ${starMismatchCorrected}\n` +
+    `- update errors: ${updateErrors}\n` +
     `- lookup errors: ${postedLookupErrors + lookupErrors}`;
 
   if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {
