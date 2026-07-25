@@ -3,7 +3,6 @@ import { App, ExpressReceiver } from "@slack/bolt";
 import * as events from "./events/index";
 import prisma from "./utils/prisma";
 import { logError, postLog } from "./utils/log";
-import { runSyncJob } from "./jobs/sync";
 import { runDailyOverview } from "./jobs/dailyOverview";
 
 dotenv.config();
@@ -64,10 +63,9 @@ expressReceiver.app.get("/status", (req, res) => {
     console.log(`Loaded event: ${event}`);
   }
 
-  runSyncJob(app).catch((err) => logError(app.client, "Initial sync job failed", err));
-  setInterval(() => {
-    runSyncJob(app).catch((err) => logError(app.client, "Scheduled sync job failed", err));
-  }, ONE_DAY_MS);
+  // Sync no longer runs on startup/interval — every restart auto-posting the
+  // pending backlog was racing with manual posts and admin cleanup. Trigger
+  // it on demand instead via /ninja-sync (see events/sync.ts).
 
   setInterval(() => {
     runDailyOverview(app).catch((err) => logError(app.client, "Daily overview failed", err));
