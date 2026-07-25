@@ -17,6 +17,30 @@ export type StarLookup =
   | { ok: true; stars: number; error?: undefined }
   | { ok: false; stars?: undefined; error: string };
 
+// Shared by getLiveStarCount (message fetched via reactions.get) and any
+// caller that already has a message object from conversations.history/replies
+// — those embed a `reactions` array inline, so no extra API call is needed to
+// read a star count off of one.
+//
+// A message's author starring their own post shouldn't help it qualify. The
+// reaction_added handlers already ignore the author's own event, but that only
+// stops it triggering a check — the count itself came straight from Slack and
+// included their star, so an author could still supply one of the five.
+//
+// `count` is authoritative; `users` is truncated at 50 by Slack, so on a
+// message with more reactions than that the author may not be visible and no
+// adjustment is made. That only ever leaves the displayed number one too high
+// on posts far above the threshold, and never subtracts a star that wasn't
+// there.
+export function starCountFromMessage(message: Record<string, any> | undefined): number {
+  const reactions = message?.reactions as Array<Record<string, any>> | undefined;
+  const star = reactions?.find((r) => r.name === "star");
+  if (!star) return 0;
+  const author = message?.user as string | undefined;
+  const authorStarred = Boolean(author && Array.isArray(star.users) && star.users.includes(author));
+  return Math.max(0, star.count - (authorStarred ? 1 : 0));
+}
+
 export async function getLiveStarCount(
   client: WebClient,
   channel: string,
@@ -25,24 +49,7 @@ export async function getLiveStarCount(
   try {
     const res = await client.reactions.get({ channel, timestamp: ts });
     const message = res.message as Record<string, any> | undefined;
-    const reactions = message?.reactions as Array<Record<string, any>> | undefined;
-    const star = reactions?.find((r) => r.name === "star");
-    if (!star) return { ok: true, stars: 0 };
-
-    // A message's author starring their own post shouldn't help it qualify.
-    // The reaction_added handlers already ignore the author's own event, but
-    // that only stops it triggering a check — the count itself came straight
-    // from Slack and included their star, so an author could still supply one
-    // of the five.
-    //
-    // `count` is authoritative; `users` is truncated at 50 by Slack, so on a
-    // message with more reactions than that the author may not be visible and
-    // no adjustment is made. That only ever leaves the displayed number one
-    // too high on posts far above the threshold, and never subtracts a star
-    // that wasn't there.
-    const author = message?.user as string | undefined;
-    const authorStarred = Boolean(author && Array.isArray(star.users) && star.users.includes(author));
-    return { ok: true, stars: Math.max(0, star.count - (authorStarred ? 1 : 0)) };
+    return { ok: true, stars: starCountFromMessage(message) };
   } catch (err) {
     // Callers can't act on an individual failure, but the *reason* decides
     // whether a run's lookup errors are benign (the message was deleted) or a
