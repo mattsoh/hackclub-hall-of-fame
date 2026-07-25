@@ -122,28 +122,40 @@ const reactionAddEvent = async (app: App): Promise<void> => {
       return;
     }
 
-    const { permalink } = await client.chat.getPermalink({
-      channel: event.item["channel"],
-      message_ts: event.item["ts"],
-    });
+    try {
+      const { permalink } = await client.chat.getPermalink({
+        channel: event.item["channel"],
+        message_ts: event.item["ts"],
+      });
 
-    const posted = await client.chat.postMessage({
-      channel: "C028VGT0JMQ",
-      text: `⭐ *${entry.stars}*\n${permalink}`,
-    });
+      const posted = await client.chat.postMessage({
+        channel: "C028VGT0JMQ",
+        text: `⭐ *${entry.stars}*\n${permalink}`,
+      });
 
-    await prisma.message.update(
-      {
-        where: {
-          messageId: event.item["ts"],
-        },
-        data: {
-          postedMessageId: posted.ts,
+      await prisma.message.update(
+        {
+          where: {
+            messageId: event.item["ts"],
+          },
+          data: {
+            postedMessageId: posted.ts,
+          }
         }
-      }
-    );
+      );
 
-    await prisma.appState.update({ where: { id: 1 }, data: { newPosts: { increment: 1 } } });
+      await prisma.appState.update({ where: { id: 1 }, data: { newPosts: { increment: 1 } } });
+    } catch (err) {
+      // postedMessageId is deliberately left unset on failure — announce
+      // stays true, so the next qualifying star event (or the daily sync's
+      // pending-announcement sweep) retries the post instead of losing it.
+      await logError(
+        app.client,
+        `reaction_added: failed to post new announcement — origin ${event.item["channel"]}:${event.item["ts"]}, ` +
+          `${entry.stars} stars`,
+        err
+      );
+    }
   });
 };
 
