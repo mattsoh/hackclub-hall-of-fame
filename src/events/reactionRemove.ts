@@ -35,11 +35,22 @@ const reactionRemoveEvent = async (app: App): Promise<void> => {
     await prisma.appState.update({ where: { id: 1 }, data: { starsDecreased: { increment: 1 } } });
 
     if (entry.postedMessageId && entry.stars < 5) {
+      const origin = `${event.item["channel"]}:${event.item["ts"]}`;
+      const postedId = entry.postedMessageId as string;
       try {
         await client.chat.delete({
           channel: "C028VGT0JMQ",
-          ts: entry.postedMessageId as string,
+          ts: postedId,
         });
+        console.log(
+          `reaction_removed: deleted announcement C028VGT0JMQ:${postedId} — origin ${origin} dropped to ` +
+            `${entry.stars} star(s) (< 5) after <@${event.user}> removed their :star: reaction.`
+        );
+        await logInfo(
+          app.client,
+          `:wastebasket: Deleted announcement C028VGT0JMQ:${postedId} — origin ${origin} dropped to ` +
+            `${entry.stars} star(s) (< 5) after <@${event.user}> removed their :star: reaction.`
+        );
       } catch (err) {
         const code = slackErrorCode(err);
         // Already gone is fine — that's the state we wanted anyway. Anything
@@ -47,9 +58,19 @@ const reactionRemoveEvent = async (app: App): Promise<void> => {
         if (!code || !PERMANENT_UPDATE_ERRORS.has(code)) {
           await logError(
             app.client,
-            `reaction_removed: failed to delete announcement — origin ${event.item["channel"]}:${event.item["ts"]}, ` +
-              `announcement C028VGT0JMQ:${entry.postedMessageId}`,
+            `reaction_removed: failed to delete announcement — origin ${origin}, ` +
+              `announcement C028VGT0JMQ:${postedId}`,
             err
+          );
+        } else {
+          console.log(
+            `reaction_removed: announcement C028VGT0JMQ:${postedId} already gone (${code}) — origin ${origin} ` +
+              `dropped to ${entry.stars} star(s) (< 5) after <@${event.user}> removed their :star: reaction.`
+          );
+          await logInfo(
+            app.client,
+            `:wastebasket: Announcement C028VGT0JMQ:${postedId} was already gone (${code}) — origin ${origin} ` +
+              `dropped to ${entry.stars} star(s) (< 5) after <@${event.user}> removed their :star: reaction.`
           );
         }
       }
