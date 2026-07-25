@@ -87,13 +87,17 @@ async function getLiveStarCount(app: App, channel: string, ts: string): Promise<
 async function runSyncJobBody(app: App, db: Client): Promise<void> {
   await logInfo(app.client, "Starting sync job...");
 
+  await logInfo(app.client, "Sync job: fetching #hall-of-fame history from Slack...");
   const slackPosts = await fetchHallOfFameHistory(app);
+  await logInfo(app.client, `Sync job: fetched ${slackPosts.size} posted messages from Slack.`);
 
+  await logInfo(app.client, "Sync job: loading posted messages from DB...");
   const postedRes = await db.query<DbRow>(
     `SELECT "messageId", "channelId", stars, "postedMessageId" FROM "Message"
      WHERE "postedMessageId" IS NOT NULL AND "postedMessageId" != ''`
   );
   const dbPostedByPostedId = new Map(postedRes.rows.map((r) => [r.postedMessageId as string, r]));
+  await logInfo(app.client, `Sync job: loaded ${postedRes.rows.length} posted messages from DB.`);
 
   const missingFromDb: Array<{ postedTs: string } & SlackPost> = [];
   const starMismatches: Array<{ postedTs: string; messageId: string; slackStars: number; dbStars: number }> = [];
@@ -119,6 +123,9 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     if (!existing || row.stars > existing.stars) byOrigin.set(key, row);
   }
 
+  if (byOrigin.size > 0) {
+    await logInfo(app.client, `Sync job: backfilling ${byOrigin.size} messages missing from DB...`);
+  }
   let backfilledCount = 0;
   for (const row of byOrigin.values()) {
     await db.query(
@@ -133,12 +140,16 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     );
     backfilledCount++;
   }
+  if (backfilledCount > 0) {
+    await logInfo(app.client, `Sync job: backfilled ${backfilledCount} messages into DB.`);
+  }
 
   // Check every currently-unposted row against its live Slack star count.
   const unpostedRes = await db.query<DbRow>(
     `SELECT "messageId", "channelId", stars, "postedMessageId" FROM "Message"
      WHERE "postedMessageId" IS NULL OR "postedMessageId" = ''`
   );
+  await logInfo(app.client, `Sync job: checking live star counts for ${unpostedRes.rows.length} unposted messages...`);
 
   let driftedCount = 0;
   let lookupErrors = 0;
@@ -152,6 +163,10 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     }
     await delay(REACTION_CALL_DELAY_MS);
   }
+  await logInfo(
+    app.client,
+    `Sync job: finished live star check — ${driftedCount} drifted, ${lookupErrors} lookup errors out of ${unpostedRes.rows.length}.`
+  );
 
   // Rows that are unposted, qualify (>= 5 live stars), and haven't been
   // explicitly excluded (announce=false is the default outcome of the drift
@@ -161,6 +176,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
      WHERE announce = false AND stars >= 5 AND ("postedMessageId" IS NULL OR "postedMessageId" = '')`
   );
   const pending = pendingRes.rows;
+  await logInfo(app.client, `Sync job: found ${pending.length} pending announcements.`);
 
   const nothingFound =
     backfilledCount === 0 && deletedFromSlack.length === 0 && starMismatches.length === 0 && pending.length === 0;
@@ -178,6 +194,7 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `- lookup errors: ${lookupErrors}`;
 
   if (pending.length > 0 && pending.length <= PENDING_AUTO_SEND_THRESHOLD) {
+    await logInfo(app.client, `Sync job: auto-sending ${pending.length} pending announcements...`);
     const sentLines: string[] = [];
     for (const row of pending) {
       const link = originLink(row.channelId, row.messageId);

@@ -5,6 +5,7 @@ const ERROR_PING_USER = "U07DPHQCCCS";
 
 export async function postLog(client: WebClient, text: string, ping = false): Promise<string | undefined> {
   const message = ping ? `<@${ERROR_PING_USER}> ${text}` : text;
+  console.log(message);
 
   try {
     const result = await client.chat.postMessage({
@@ -15,7 +16,6 @@ export async function postLog(client: WebClient, text: string, ping = false): Pr
   } catch (e) {
     // The logger must never crash the app or cause a failure loop.
     console.error("Failed to post log message to Slack:", e);
-    console.log(message);
     return undefined;
   }
 }
