@@ -2,7 +2,7 @@ import { App } from "@slack/bolt";
 import { Client } from "pg";
 import { withPgClient } from "../utils/pg";
 import { logError, logInfo, postLog, LOG_CHANNEL } from "../utils/log";
-import { getLiveStarCount, slackErrorCode } from "../utils/stars";
+import { getLiveStarCount, slackErrorCode, PERMANENT_UPDATE_ERRORS } from "../utils/stars";
 
 const HALL_OF_FAME_CHANNEL = "C028VGT0JMQ";
 // Matched by name, not bot_id: the app's bot_id changed at least once (an app
@@ -47,12 +47,6 @@ const SEND_CATCHUP_WINDOW_HOURS = 24;
 const CHANNEL_POST_LIMIT = 3;
 const THREAD_CHUNK_SIZE = 40;
 const ERROR_SAMPLE_SIZE = 10;
-
-// Slack errors that will never succeed on a retry: the announcement was
-// authored by a different app installation, or it no longer exists. Retrying
-// these every run just burns API calls and pings a human for something no
-// amount of retrying can fix.
-const PERMANENT_UPDATE_ERRORS = new Set(["cant_update_message", "message_not_found", "channel_not_found"]);
 
 interface SlackPost {
   stars: number;

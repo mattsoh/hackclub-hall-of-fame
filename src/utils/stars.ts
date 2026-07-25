@@ -8,6 +8,11 @@ import type { WebClient } from "@slack/web-api";
 // project compiles with strictNullChecks off, and TypeScript won't narrow a
 // discriminated union by its `ok` flag in that mode. Declaring both properties
 // on both members keeps them reachable without a cast.
+// Slack errors that will never succeed on a retry when updating/reading an
+// existing announcement: it was deleted, its channel is gone, or it was
+// posted by a different app installation this token can't edit.
+export const PERMANENT_UPDATE_ERRORS = new Set(["cant_update_message", "message_not_found", "channel_not_found"]);
+
 export type StarLookup =
   | { ok: true; stars: number; error?: undefined }
   | { ok: false; stars?: undefined; error: string };

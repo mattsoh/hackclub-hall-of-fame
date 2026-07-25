@@ -1,6 +1,7 @@
 import { App, ReactionMessageItem } from "@slack/bolt";
 import prisma from "../utils/prisma";
-import { getLiveStarCount } from "../utils/stars";
+import { getLiveStarCount, slackErrorCode, PERMANENT_UPDATE_ERRORS } from "../utils/stars";
+import { logError } from "../utils/log";
 
 const reactionAddEvent = async (app: App): Promise<void> => {
   app.event("reaction_added", async ({ event, client }) => {
@@ -53,16 +54,36 @@ const reactionAddEvent = async (app: App): Promise<void> => {
     // `announce`, and never changes that flag. Handled before either of those
     // checks so neither can suppress an update.
     if (entry.postedMessageId) {
-      const { permalink } = await client.chat.getPermalink({
-        channel: event.item["channel"],
-        message_ts: event.item["ts"],
-      });
+      try {
+        const { permalink } = await client.chat.getPermalink({
+          channel: event.item["channel"],
+          message_ts: event.item["ts"],
+        });
 
-      await client.chat.update({
-        channel: "C028VGT0JMQ",
-        ts: entry.postedMessageId as string,
-        text: `⭐ *${entry.stars}*\n${permalink}`,
-      });
+        await client.chat.update({
+          channel: "C028VGT0JMQ",
+          ts: entry.postedMessageId as string,
+          text: `⭐ *${entry.stars}*\n${permalink}`,
+        });
+      } catch (err) {
+        const code = slackErrorCode(err);
+        if (code && PERMANENT_UPDATE_ERRORS.has(code)) {
+          // The origin message or its announcement is gone — clear the link
+          // so this stops failing on every future star event and the row is
+          // picked up fresh (as unposted) by the next sync/reaction instead.
+          await prisma.message.update({
+            where: { messageId: event.item["ts"] },
+            data: { postedMessageId: "" },
+          });
+        } else {
+          await logError(
+            app.client,
+            `reaction_added: failed to update announcement — origin ${event.item["channel"]}:${event.item["ts"]}, ` +
+              `announcement C028VGT0JMQ:${entry.postedMessageId}`,
+            err
+          );
+        }
+      }
       return;
     }
 
