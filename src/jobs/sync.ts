@@ -23,14 +23,19 @@ const HISTORY_CALL_DELAY_MS = 1250;
 const SEND_DELAY_MS = 1200;
 
 // Hard ceiling on reactions.get calls per run. At the pacing above this caps a
-// run at ~25 minutes. There are thousands of tracked messages and no bulk
-// reaction API, so a single run cannot cover all of them without running for
-// hours; instead each run checks everything recent plus a rotating slice of
-// the backlog (see selectRowsToCheck).
+// run at ~25 minutes. There is no bulk reaction API, so a single run cannot
+// cover every tracked message without running for hours; instead each run
+// checks everything recent plus a rotating slice of the rest of the window
+// (see selectRowsToCheck).
 const MAX_REACTION_CALLS_PER_RUN = 1200;
 // Messages younger than this are checked on every run — practically all star
 // activity happens here. Older ones are reconciled by rotation.
 const RECENT_WINDOW_DAYS = 30;
+// Messages older than this are left alone entirely. Their star counts have
+// long since stopped moving, and the announcements predating the last app
+// reinstall can't be edited by this token anyway, so scanning them only spends
+// a rate-limited API budget that the recent window has a real use for.
+const MAX_MESSAGE_AGE_DAYS = 365;
 
 const PENDING_AUTO_SEND_THRESHOLD = 10;
 const THREAD_CHUNK_SIZE = 40;
@@ -126,17 +131,21 @@ async function fetchHallOfFameHistory(app: App): Promise<Map<string, SlackPost>>
   return posts;
 }
 
-// Everything within RECENT_WINDOW_DAYS, plus as much of the older backlog as
-// the per-run budget allows, resuming from where the last run stopped so the
-// whole backlog is covered over successive runs.
+// Everything within RECENT_WINDOW_DAYS, plus as much of the rest of the
+// one-year window as the per-run budget allows, resuming from where the last
+// run stopped so the whole window is covered over successive runs. Anything
+// older than MAX_MESSAGE_AGE_DAYS is ignored.
 function selectRowsToCheck(
   rows: ScanRow[],
   cursor: number
-): { toCheck: ScanRow[]; nextCursor: number; olderTotal: number } {
-  const recentCutoff = Math.floor(Date.now() / 1000) - RECENT_WINDOW_DAYS * 24 * 60 * 60;
+): { toCheck: ScanRow[]; nextCursor: number; olderTotal: number; skippedTooOld: number } {
+  const now = Math.floor(Date.now() / 1000);
+  const recentCutoff = now - RECENT_WINDOW_DAYS * 24 * 60 * 60;
+  const ageCutoff = now - MAX_MESSAGE_AGE_DAYS * 24 * 60 * 60;
 
-  const recent = rows.filter((r) => tsSeconds(r.messageId) >= recentCutoff);
-  const older = rows
+  const inWindow = rows.filter((r) => tsSeconds(r.messageId) >= ageCutoff);
+  const recent = inWindow.filter((r) => tsSeconds(r.messageId) >= recentCutoff);
+  const older = inWindow
     .filter((r) => tsSeconds(r.messageId) < recentCutoff)
     .sort((a, b) => tsSeconds(a.messageId) - tsSeconds(b.messageId));
 
@@ -153,6 +162,7 @@ function selectRowsToCheck(
     toCheck: [...recent, ...olderSlice],
     nextCursor: last ? tsSeconds(last.messageId) : cursor,
     olderTotal: older.length,
+    skippedTooOld: rows.length - inWindow.length,
   };
 }
 
@@ -233,12 +243,13 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     ...postedRes.rows.map((r) => ({ ...r, isPosted: true })),
     ...unpostedRes.rows.map((r) => ({ ...r, isPosted: false })),
   ];
-  const { toCheck, nextCursor, olderTotal } = selectRowsToCheck(scanRows, cursor);
+  const { toCheck, nextCursor, olderTotal, skippedTooOld } = selectRowsToCheck(scanRows, cursor);
 
   await logInfo(
     app.client,
     `Sync job: checking live star counts for ${toCheck.length} of ${scanRows.length} tracked messages ` +
-      `(everything from the last ${RECENT_WINDOW_DAYS} days, plus a rotating slice of the ${olderTotal} older ones).`
+      `(everything from the last ${RECENT_WINDOW_DAYS} days, plus a rotating slice of the ${olderTotal} older ones ` +
+      `still inside the ${MAX_MESSAGE_AGE_DAYS}-day window; ${skippedTooOld} older than that are not checked).`
   );
 
   let starMismatchCorrected = 0;
@@ -332,8 +343,18 @@ async function runSyncJobBody(app: App, db: Client): Promise<void> {
     `SELECT "messageId", "channelId", stars, "postedMessageId" FROM "Message"
      WHERE announce = false AND stars >= 5 AND ("postedMessageId" IS NULL OR "postedMessageId" = '')`
   );
-  const pending = pendingRes.rows;
-  await logInfo(app.client, `Sync job: found ${pending.length} pending announcements.`);
+  // Held to the same one-year window as the star check above. Outside it the
+  // stored star count is no longer reconciled against Slack, so announcing on
+  // the strength of it would mean posting an unverified number — and posting a
+  // year-old message to #hall-of-fame isn't wanted regardless.
+  const ageCutoff = Math.floor(Date.now() / 1000) - MAX_MESSAGE_AGE_DAYS * 24 * 60 * 60;
+  const pending = pendingRes.rows.filter((r) => tsSeconds(r.messageId) >= ageCutoff);
+  const pendingTooOld = pendingRes.rows.length - pending.length;
+  await logInfo(
+    app.client,
+    `Sync job: found ${pending.length} pending announcements` +
+      (pendingTooOld > 0 ? ` (plus ${pendingTooOld} older than ${MAX_MESSAGE_AGE_DAYS} days, not announced).` : ".")
+  );
 
   const nothingFound =
     backfilledCount === 0 &&
