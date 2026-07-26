@@ -43,12 +43,12 @@ export function registerChannelEvents(app: App): void {
     const channelId = (body as Record<string, any>).channel?.id as string | undefined;
     if (!channelId) return;
     try {
-      // Ephemeral, not a public "Leaving!" — the person opting out is the only
-      // one who needs to see it.
-      await client.chat.postEphemeral({
+      // Public, not ephemeral: this opts the whole channel out, so everyone in
+      // it needs to know the bot is gone and how to get it back — not just
+      // whoever happened to press the button.
+      await client.chat.postMessage({
         channel: channelId,
-        user: (body as Record<string, any>).user?.id,
-        text: "Leaving — add me back any time with `/invite @Hall of Fame`.",
+        text: "Leaving! Nothing from this channel will reach the hall of fame any more. Add me back any time with `/invite @Hall of Fame`.",
       });
       await client.conversations.leave({ channel: channelId });
     } catch (err) {
