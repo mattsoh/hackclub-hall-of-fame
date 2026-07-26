@@ -27,10 +27,23 @@ const USAGE = [
 type Respond = (message: string) => Promise<unknown>;
 
 async function doCheck(app: App, text: string, respond: Respond): Promise<void> {
-  const match = CHANNEL_REF.exec(text.trim());
+  const trimmed = text.trim();
+  const match = CHANNEL_REF.exec(trimmed);
   const channelId = match?.[1] ?? match?.[2];
   if (!channelId) {
-    await respond("Usage: `/hof check <#channel>`");
+    // A bare "#name" means Slack sent the text unescaped, which carries no
+    // channel id to look anything up with. Worth saying explicitly — the fix is
+    // a checkbox in the app's slash command settings, not anything the invoker
+    // did wrong.
+    const looksUnescaped = trimmed.startsWith("#");
+    await respond(
+      "Usage: `/hof check <#channel>`" +
+        (looksUnescaped
+          ? `\nSlack sent me \`${trimmed}\` with no channel id attached. Pick the channel from the autocomplete ` +
+            "list instead of typing it, or paste its ID (starts with `C`). If it keeps happening, turn on " +
+            "\"Escape channels, users, and links\" for this command in the Slack app settings."
+          : "")
+    );
     return;
   }
 
@@ -63,7 +76,8 @@ async function doReconcile(app: App, userId: string, respond: Respond): Promise<
     return;
   }
   await respond(
-    `Reconcile started. It takes a while; the summary will be posted in <#${CHANNELS.log}> when it's done. ` +
+    `Reconcile started — watch it in <#${CHANNELS.log}>: it posts one message and streams every phase into ` +
+      "that message's thread, then rewrites it into the summary when it's done. " +
       `At most ${RULES.maxCatchUpPostsPerRun} missed announcements will be posted, and only for messages ` +
       `younger than ${RULES.catchUpWindowHours}h.`
   );

@@ -14,8 +14,8 @@
 import type { App } from "@slack/bolt";
 import type { WebClient } from "@slack/web-api";
 import * as db from "./db";
-import { BOT_NAME, CHANNELS, RULES, SCAN, TIMING } from "./config";
-import { log } from "./log";
+import { BOT_NAME, CHANNELS, LOGGING, RULES, SCAN, TIMING } from "./config";
+import { log, RunLog } from "./log";
 import {
   ANNOUNCEMENT_STARS,
   delay,
@@ -150,21 +150,16 @@ function selectToCheck(rows: db.MessageRow[], cursor: string): Selection {
   };
 }
 
-export async function runReconcile(
-  client: WebClient,
-  opts: { dry?: boolean } = {}
-): Promise<ReconcileSummary> {
-  const dry = Boolean(opts.dry);
+async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Promise<ReconcileSummary> {
   const startedAt = Date.now();
   const lines: string[] = [];
   const details: string[] = [];
   const warnings: string[] = [];
 
   const botId = await ownBotId(client);
-
-  log.progress("reconcile: reading #hall-of-fame history…");
+  run.step(`reading #hall-of-fame history (up to ${SCAN.maxHistoryPages} pages)…`);
   const { announcements, truncated, unparseable } = await readHallOfFame(client);
-  log.progress(`reconcile: ${announcements.length} announcements in the channel`);
+  run.step(`found ${announcements.length} announcements in the channel`);
 
   if (truncated) {
     // Without the full channel, "this announcement isn't in Slack" is not a
@@ -183,6 +178,7 @@ export async function runReconcile(
   const unposted = await db.unpostedRows();
   const postedByAnnouncementTs = new Map(posted.map((r) => [r.postedMessageId as string, r]));
   const trackedOrigins = new Set(posted.map((r) => r.messageId));
+  run.step(`database has ${posted.length} announced and ${unposted.length} unannounced message(s)`);
 
   // ---- Record announcements the database has no row for -------------------
   // These are already in the channel. Recording them is what stops the
@@ -216,7 +212,12 @@ export async function runReconcile(
       if (!dry) await db.recordAnnounced(a.originTs as string, a.originChannel as string, a.stars, a.ts);
       recorded++;
     }
-    if (recorded > 0) log.progress(`reconcile: recorded ${recorded} untracked announcement(s)`);
+    run.step(
+      recorded > 0
+        ? `recorded ${recorded} announcement(s) the database had lost` +
+          (duplicates > 0 ? `, and counted ${duplicates} duplicate(s) in the channel` : "")
+        : "no untracked announcements to record"
+    );
   }
 
   // ---- Announcements a human deleted --------------------------------------
@@ -237,7 +238,11 @@ export async function runReconcile(
         details.push(`removed by hand: ${permalinkOf(row.channelId, row.messageId)}`);
       }
     }
-    if (humanDeleted > 0) log.progress(`reconcile: ${humanDeleted} announcement(s) were deleted by hand`);
+    run.step(
+      humanDeleted > 0
+        ? `${humanDeleted} announcement(s) were deleted by hand — clearing their links and marking them skipped`
+        : "no announcements were deleted by hand"
+    );
   }
 
   // ---- Live star check ---------------------------------------------------
@@ -245,9 +250,14 @@ export async function runReconcile(
   const selection = selectToCheck([...posted, ...unposted], state.scanCursor ?? "");
   const announcementByOrigin = new Map(announcements.filter((a) => a.originTs).map((a) => [a.originTs as string, a]));
 
-  log.progress(
-    `reconcile: checking live star counts on ${selection.toCheck.length} message(s) ` +
-      `(everything from the last ${SCAN.alwaysRecheckDays} days plus a rotating slice of ${selection.olderTotal} older)`
+  // A floor, not an estimate: measured runs come in around 1.5x this, because
+  // some calls still hit a 429 and wait out the WebClient's own retry on top of
+  // our pacing. 800 checks paced at 1250ms predicts 17 min and took 24.
+  const atLeastMinutes = Math.round((selection.toCheck.length * TIMING.slackReadDelayMs) / 60000);
+  run.step(
+    `checking live star counts on ${selection.toCheck.length} message(s) — everything from the last ` +
+      `${SCAN.alwaysRecheckDays} days plus a rotating slice of the ${selection.olderTotal} older ones. ` +
+      `This is the slow part: at least ${atLeastMinutes} min, usually nearer ${Math.round(atLeastMinutes * 1.5)}.`
   );
 
   // Only counts confirmed against Slack in this run are allowed to trigger a
@@ -267,7 +277,13 @@ export async function runReconcile(
 
     // The cursor is persisted as the scan proceeds, so a run that dies partway
     // through keeps its rotation progress instead of discarding all of it.
-    if (!dry && checked % 100 === 0) await db.setScanCursor(row.messageId);
+    if (checked % LOGGING.starCheckReportEvery === 0) {
+      if (!dry) await db.setScanCursor(row.messageId);
+      run.step(
+        `checked ${checked}/${selection.toCheck.length} — ${corrected} count(s) corrected, ` +
+          `${updated} announcement(s) updated, ${lookupErrors} lookup error(s)`
+      );
+    }
 
     if (!result.ok) {
       lookupErrors++;
@@ -300,6 +316,10 @@ export async function runReconcile(
   }
 
   if (!dry) await db.setScanCursor(selection.nextCursor);
+  run.step(
+    `finished the star check: ${checked} checked, ${corrected} corrected, ${updated} announcement(s) updated, ` +
+      `${uneditable} un-editable, ${lookupErrors} lookup error(s)`
+  );
 
   // ---- Post what was genuinely missed ------------------------------------
   const candidates = unposted
@@ -312,6 +332,13 @@ export async function runReconcile(
 
   // Oldest first, so the channel reads chronologically.
   fresh.sort((a, b) => a.row.messageId.localeCompare(b.row.messageId));
+
+  run.step(
+    `${candidates.length} message(s) qualify but aren't announced: ${fresh.length} inside the ` +
+      `${RULES.catchUpWindowHours}h catch-up window` +
+      (stale > 0 ? `, ${stale} older than it (recorded, not posted)` : "") +
+      (fresh.length > RULES.maxCatchUpPostsPerRun ? ` — capped at ${RULES.maxCatchUpPostsPerRun} this run` : "")
+  );
 
   let announced = 0;
   let throttled = 0;
@@ -376,7 +403,31 @@ export async function runReconcile(
   return { lines, details, changed };
 }
 
-// Entry point used by the timer, the slash command and the CLI.
+// Runs a reconcile and reports it. Every phase streams into the thread of a
+// single channel message, which is then rewritten into the summary — so a run
+// that takes tens of minutes is visibly progressing the whole time, and the
+// channel still only gains one message per run.
+export async function runReconcile(
+  client: WebClient,
+  opts: { dry?: boolean } = {}
+): Promise<ReconcileSummary> {
+  const dry = Boolean(opts.dry);
+  const run = log.startRun(dry ? "Reconcile (dry run)" : "Reconcile");
+  const startedAt = Date.now();
+  try {
+    const summary = await reconcileBody(client, dry, run);
+    await run.finish(summary.lines.join("\n"), summary.details);
+    return summary;
+  } catch (err) {
+    // The run message must reach a terminal state either way, or the channel is
+    // left showing "running…" for a job that died half an hour ago.
+    const minutes = Math.round((Date.now() - startedAt) / 60000);
+    await run.finish(`:rotating_light: *Reconcile failed* after ${minutes} min — see the error in this channel.`);
+    throw err;
+  }
+}
+
+// Entry point used by the timer and the slash command.
 export async function reconcile(app: App, opts: { dry?: boolean } = {}): Promise<void> {
   if (running) {
     log.info("Reconcile: a run is already in progress, skipping this one.");
@@ -384,8 +435,7 @@ export async function reconcile(app: App, opts: { dry?: boolean } = {}): Promise
   }
   running = true;
   try {
-    const summary = await runReconcile(app.client, opts);
-    await log.report(summary.lines.join("\n"), summary.details);
+    await runReconcile(app.client, opts);
     if (!opts.dry) await db.markReconciled();
   } catch (err) {
     log.error("Reconcile failed", err);

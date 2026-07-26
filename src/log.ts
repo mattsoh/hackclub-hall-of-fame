@@ -19,9 +19,20 @@ import { ADMIN_USER, CHANNELS, LOGGING } from "./config";
 
 type Level = "info" | "warn" | "error";
 
+// Progress reporter for one long-running job. `step` is fire-and-forget so the
+// job never blocks on Slack; `finish` is awaited so the summary is written
+// before the caller moves on.
+export interface RunLog {
+  step(message: string): void;
+  finish(summary: string, details?: string[]): Promise<void>;
+}
+
 interface QueuedPost {
   text: string;
   threadTs?: string;
+  // When set, edit this message instead of posting a new one. Lets a long job
+  // turn its own "running…" message into the final summary.
+  editTs?: string;
   // Resolved with the posted message's ts, so a caller that wants to thread
   // detail under its summary can await just that one post.
   resolve: (ts: string | undefined) => void;
@@ -69,17 +80,22 @@ async function drain(): Promise<void> {
       const item = queue.shift() as QueuedPost;
       let ts: string | undefined;
       try {
-        const res = await slack?.chat.postMessage({
-          channel: CHANNELS.log,
-          text: item.text,
-          thread_ts: item.threadTs,
-          // Long summaries embed permalinks to origin messages; unfurling every
-          // one of them turns a summary into a screenful.
-          unfurl_links: false,
-        });
-        ts = res?.ts as string | undefined;
+        if (item.editTs) {
+          await slack?.chat.update({ channel: CHANNELS.log, ts: item.editTs, text: item.text });
+          ts = item.editTs;
+        } else {
+          const res = await slack?.chat.postMessage({
+            channel: CHANNELS.log,
+            text: item.text,
+            thread_ts: item.threadTs,
+            // Long summaries embed permalinks to origin messages; unfurling every
+            // one of them turns a summary into a screenful.
+            unfurl_links: false,
+          });
+          ts = res?.ts as string | undefined;
+        }
       } catch (err) {
-        console.error(stamp("error", `logger: failed to post to Slack: ${safeString(err)}`));
+        console.error(stamp("error", `logger: failed to write to Slack: ${safeString(err)}`));
       }
       item.resolve(ts);
       if (queue.length > 0) await delay(LOGGING.postSpacingMs);
@@ -89,10 +105,10 @@ async function drain(): Promise<void> {
   }
 }
 
-function enqueue(text: string, threadTs?: string): Promise<string | undefined> {
+function enqueue(text: string, threadTs?: string, editTs?: string): Promise<string | undefined> {
   if (!slackEnabled || !slack) return Promise.resolve(undefined);
   return new Promise<string | undefined>((resolve) => {
-    queue.push({ text: clamp(text), threadTs, resolve });
+    queue.push({ text: clamp(text), threadTs, editTs, resolve });
     void drain();
   });
 }
@@ -178,19 +194,43 @@ export const log = {
     console.log(stamp("info", message));
   },
 
-  // A summary plus its supporting detail: one Slack message, with the detail
-  // as threaded replies so an arbitrarily long list can't blow the message
-  // size limit or bury the channel.
-  async report(message: string, details: string[] = []): Promise<void> {
-    console.log(stamp("info", [message, ...details].join("\n")));
-    if (!slackEnabled) return;
-    const parentTs = await enqueue(message);
-    if (!parentTs || details.length === 0) return;
+  // A job that takes long enough that silence is indistinguishable from being
+  // stuck. Posts one message to the channel immediately, streams its progress
+  // into that message's thread, and finally rewrites the message itself into the
+  // summary. So the channel shows one line per run and the thread shows the
+  // whole play-by-play.
+  startRun(title: string): RunLog {
+    const startedAt = Date.now();
+    const parent = enqueue(`:hourglass_flowing_sand: *${title}* — running…`);
 
-    const perMessage = 40;
-    for (let i = 0; i < details.length; i += perMessage) {
-      await enqueue(details.slice(i, i + perMessage).join("\n"), parentTs);
-    }
+    const elapsed = (): string => {
+      const seconds = Math.round((Date.now() - startedAt) / 1000);
+      return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, "0")}s`;
+    };
+
+    return {
+      step(message: string): void {
+        console.log(stamp("info", `[${elapsed()}] ${message}`));
+        // Fire and forget: a job must never wait on its own progress log.
+        void parent.then((ts) => {
+          if (ts) void enqueue(`\`${elapsed().padStart(6)}\`  ${message}`, ts);
+        });
+      },
+
+      async finish(summary: string, details: string[] = []): Promise<void> {
+        console.log(stamp("info", [summary, ...details].join("\n")));
+        const ts = await parent;
+        if (!ts) return;
+
+        const perMessage = 40;
+        for (let i = 0; i < details.length; i += perMessage) {
+          await enqueue(details.slice(i, i + perMessage).join("\n"), ts);
+        }
+        // Rewrite the original message, so the channel ends up holding the
+        // result rather than a stale "running…".
+        await enqueue(summary, undefined, ts);
+      },
+    };
   },
 
   // Awaits the queue. Called before a deliberate exit so the message that

@@ -133,8 +133,9 @@ async function cmdPending(client: WebClient, args: Args): Promise<void> {
 
 async function cmdReconcile(client: WebClient, args: Args): Promise<void> {
   if (!args.apply) console.log("Dry run — nothing will be written or posted. Pass --apply to act.\n");
-  const summary = await runReconcile(client, { dry: !args.apply });
-  console.log([...summary.lines, ...summary.details].join("\n").replace(/\*/g, ""));
+  // No printing here: runReconcile streams every phase and its final summary to
+  // the console as it goes (and to Slack too, when --apply turned that on).
+  await runReconcile(client, { dry: !args.apply });
 }
 
 // Announces specific messages, named one at a time. This overrides the age rule

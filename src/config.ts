@@ -115,6 +115,10 @@ export const SCAN = {
 };
 
 export const LOGGING = {
+  // How often the star-check loop reports progress into the run's thread. At 800
+  // checks that's 8 updates — enough to see it moving, few enough that the
+  // thread stays readable.
+  starCheckReportEvery: 100,
   // Identical messages inside this window are counted rather than re-posted.
   // Production logged the same message_not_found six times in seven minutes,
   // pinging a human each time.
