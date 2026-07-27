@@ -53,6 +53,34 @@ export type PostResult =
 // Posts a new announcement for an origin message. Safe to call concurrently for
 // the same message: the row is claimed first, so of two simultaneous callers
 // exactly one posts and the other gets `claimed`.
+// The burst limit is a check-then-act, and the two halves are far apart:
+// channelHasRoom() counts rows written by setPosted(), and setPosted() only
+// runs after chat.postMessage has returned. Star events arriving together
+// therefore all read the same count and all pass it — which is precisely how
+// four announcements from one channel reached the feed inside three seconds,
+// with the limit set to three. The per-message claim doesn't help, because
+// each event is a different message.
+//
+// Posting is serialised per channel so each caller's count includes the posts
+// its predecessors just made. One replica, so an in-process lock is exact; if
+// this is ever scaled out the check needs to move into the database.
+const channelLocks = new Map<string, Promise<void>>();
+
+function withChannelLock<T>(channelId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = channelLocks.get(channelId) ?? Promise.resolve();
+  // `fn` for both branches: one caller failing must not skip the next.
+  const run = prev.then(fn, fn);
+  const tail = run.then(
+    () => undefined,
+    () => undefined
+  );
+  channelLocks.set(channelId, tail);
+  void tail.then(() => {
+    if (channelLocks.get(channelId) === tail) channelLocks.delete(channelId);
+  });
+  return run;
+}
+
 export async function postAnnouncement(
   client: WebClient,
   row: { messageId: string; channelId: string; skip?: boolean },
@@ -60,13 +88,25 @@ export async function postAnnouncement(
   opts: { ignoreThrottle?: boolean } = {}
 ): Promise<PostResult> {
   if (row.skip) return { posted: false, reason: "skipped" };
+  return withChannelLock(row.channelId, () => postAnnouncementLocked(client, row, stars, opts));
+}
 
+async function postAnnouncementLocked(
+  client: WebClient,
+  row: { messageId: string; channelId: string; skip?: boolean },
+  stars: number,
+  opts: { ignoreThrottle?: boolean }
+): Promise<PostResult> {
   if (!opts.ignoreThrottle && !(await channelHasRoom(row.channelId))) {
-    // Deliberately left as-is: still unposted, still eligible, so the next
-    // star event or reconcile run picks it up rather than losing it. The old
-    // code dropped throttled entries into a permanent hold-back, which
-    // systematically destroyed the overflow from exactly the busiest channels.
-    log.progress(`throttled: ${row.channelId}/${row.messageId} — ${RULES.maxPostsPerChannel} posts already in the last ${RULES.burstWindowMinutes}m`);
+    // Throttling retires the message rather than deferring it. Leaving it
+    // eligible meant the overflow from a burst was simply posted later, so the
+    // limit only spread a flood out instead of preventing it. The cost is that
+    // a message throttled once is never announced on its own: `hof unskip`
+    // brings it back.
+    await db.setSkip(row.messageId, true).catch((err) => {
+      log.warn(`Could not mark ${row.channelId}/${row.messageId} skipped after throttling`, err);
+    });
+    log.progress(`throttled: ${row.channelId}/${row.messageId} — ${RULES.maxPostsPerChannel} posts already in the last ${RULES.burstWindowMinutes}m; marked skipped`);
     return { posted: false, reason: "throttled" };
   }
 

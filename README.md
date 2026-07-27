@@ -12,8 +12,12 @@ change any of this.
 - **The author's own star never counts.** Enforced in `starCount()`
   ([`src/slack.ts`](src/slack.ts)), which every path reads counts through, so a
   message needs five stars from other people.
-- **At most 3 announcements per channel per 5 minutes**, so one busy channel
-  can't take over the feed.
+- **At most 3 announcements per channel per hour**, so one busy channel can't
+  take over the feed. Posting is serialised per channel, because the limit is a
+  check-then-act and simultaneous star events used to all pass it at once. A
+  message turned away by this limit is marked skipped rather than deferred —
+  otherwise the overflow from a burst is just posted later and the limit only
+  spreads a flood out instead of preventing it. `hof unskip` brings one back.
 - **A reconcile only auto-posts messages younger than 24 hours, at most 10 per
   run.** This is what stops a restart replaying a backlog into the channel — see
   below.

@@ -32,8 +32,13 @@ export const RULES = {
   // No more than this many announcements from a single channel inside
   // burstWindowMinutes. Stops one busy channel taking over the feed. Applied
   // identically by the live handler and the reconciler.
+  //
+  // An hour rather than five minutes: at 3-per-5-minutes a single channel may
+  // legitimately post 36 times an hour, and one active thread did put seven
+  // announcements in the feed inside 32 minutes without ever breaching the
+  // old window.
   maxPostsPerChannel: 3,
-  burstWindowMinutes: 5,
+  burstWindowMinutes: 60,
 
   // The anti-restart-spam rule, and the reason it is an age test rather than a
   // stored flag. The live handler posts a qualifying message whenever it sees
