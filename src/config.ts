@@ -24,6 +24,21 @@ export const ADMIN_USER = "U07DPHQCCCS";
 // B028V7JBD5H (2021-2024) and B06LLPAFP09 (2024-present) are legitimately us.
 export const BOT_NAME = "Hall of Fame";
 
+// Slack message subtypes that represent a person actually writing something.
+// Everything else — joins, leaves, topic/purpose/permission changes, pins,
+// channel renames — is a system event nobody authored but anyone can react to.
+// A channel called #hall-of-fame-fraud was used to farm entries by starring
+// "has joined the channel" messages, which reached the feed because nothing
+// looked at the subtype.
+//
+// An allowlist, not a blocklist: Slack adds new subtypes, and an unrecognised
+// one must not qualify by default. A message with no subtype at all is an
+// ordinary message and is always allowed.
+export const ANNOUNCEABLE_SUBTYPES = new Set([
+  "file_share", // a message whose content is an attachment
+  "thread_broadcast", // a thread reply also sent to the channel
+]);
+
 export const RULES = {
   // Stars needed to reach #hall-of-fame. The author's own star never counts
   // toward this — see starCount() in policy.ts.

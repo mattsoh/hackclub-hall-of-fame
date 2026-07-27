@@ -3,7 +3,7 @@
 // message; what to *do* with the resulting number is in policy.ts.
 
 import type { WebClient } from "@slack/web-api";
-import { SCAN, TIMING } from "./config";
+import { ANNOUNCEABLE_SUBTYPES, SCAN, TIMING } from "./config";
 
 export function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -59,6 +59,16 @@ export function announcementText(stars: number, permalink: string): string {
 
 export const ANNOUNCEMENT_STARS = /^(?:⭐|:star:) \*(\d+)\*/;
 
+// System events (joins, permission changes, pins) are reactable but nobody
+// wrote them, so they can never be hall-of-fame material. A channel called
+// #hall-of-fame-fraud farmed entries by starring "has joined the channel"
+// messages, which qualified because nothing looked at the subtype.
+export function isAnnounceable(message: Record<string, any> | undefined): boolean {
+  const subtype = message?.subtype as string | undefined;
+  if (!subtype) return true;
+  return ANNOUNCEABLE_SUBTYPES.has(subtype);
+}
+
 // A message's author starring their own post must not help it qualify. The
 // reaction handlers already ignore the author's own event, but that only stops
 // it triggering a check — the count itself comes straight from Slack and
@@ -71,7 +81,15 @@ export const ANNOUNCEMENT_STARS = /^(?:⭐|:star:) \*(\d+)\*/;
 // option exists) a message with 50+ stars may not show the author — which only
 // ever leaves the number one too high on a post far above the threshold, and
 // never subtracts a star that wasn't there.
+//
+// The subtype gate lives here rather than in each caller because every path
+// reads its counts through this function — live handler, reconciler and
+// channel scanner all inherit it, and an already-posted announcement whose
+// origin turns out to be a system event now reads zero and is cleaned up on
+// the next reconcile.
 export function starCount(message: Record<string, any> | undefined): number {
+  if (!isAnnounceable(message)) return 0;
+  if (!isAnnounceable(message)) return 0;
   const reactions = message?.reactions as Array<Record<string, any>> | undefined;
   const star = reactions?.find((r) => r.name === "star");
   if (!star) return 0;
