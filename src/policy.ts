@@ -1,11 +1,11 @@
-// The rules, and the only three functions that write to #hall-of-fame.
+// The rules, and the only functions that write to #hall-of-fame.
 //
 // Every posting path goes through postAnnouncement, so the star threshold, the
-// author-star exclusion and the 3-per-channel burst limit are applied
-// identically whether the trigger was a live reaction, a reconcile catch-up or
-// a hand-run CLI command. Previously there were five posting paths: two of them
-// applied the burst limit, two of them excluded the author's own star, and they
-// wrote three different values for the `announce` flag.
+// author-star exclusion and both pace limits are applied identically whether the
+// trigger was a live reaction, a reconcile catch-up or a hand-run CLI command.
+// Previously there were five posting paths: two of them applied a rate limit, two
+// of them excluded the author's own star, and they wrote three different values
+// for the `announce` flag.
 
 import type { WebClient } from "@slack/web-api";
 import * as db from "./db";
@@ -33,14 +33,96 @@ export function withinCatchUpWindow(ts: string): boolean {
   return ageHours(ts) <= RULES.catchUpWindowHours;
 }
 
-// The burst limit: no more than RULES.maxPostsPerChannel announcements from one
-// channel inside RULES.burstWindowMinutes, so one busy channel can't take over
-// the feed.
-export async function channelHasRoom(channelId: string): Promise<boolean> {
-  const since = Math.floor(Date.now() / 1000) - RULES.burstWindowMinutes * 60;
-  const recent = await db.postsInChannelSince(channelId, since);
-  return recent < RULES.maxPostsPerChannel;
+// The two pace limits on #hall-of-fame. Both count when announcements were
+// *posted*, not how old the starred messages are, so a catch-up post and a
+// live one consume the budget the same way.
+//
+// Returns the limit that is full, or undefined when there is room.
+export async function limitReached(channelId: string): Promise<string | undefined> {
+  const now = Math.floor(Date.now() / 1000);
+
+  const lastHour = await db.postsSince(now - 3600);
+  if (lastHour >= RULES.maxPerHour) {
+    return `${RULES.maxPerHour} per hour (the channel has had ${lastHour} in the last hour)`;
+  }
+
+  const today = await db.postsInChannelSince(channelId, now - 86400);
+  if (today >= RULES.maxPerChannelPerDay) {
+    return `${RULES.maxPerChannelPerDay} per channel per day (<#${channelId}> has had ${today} in the last 24h)`;
+  }
+
+  return undefined;
 }
+
+// Asks in the log channel instead of dropping the message. Hitting a pace limit
+// is not a judgement about the message — it just means the channel is busy — so
+// the decision belongs to a person, and it stays queued until they make one.
+async function requestApproval(
+  client: WebClient,
+  row: { messageId: string; channelId: string },
+  stars: number,
+  limit: string
+): Promise<void> {
+  const outstanding = await db.pendingApprovals();
+  if (outstanding >= RULES.maxPendingApprovals) {
+    // Deliberately leaves the row untouched and un-asked: it is still unposted
+    // and still eligible, so a later reconcile picks it up once the queue has
+    // been worked through. Better than adding button number 21.
+    log.warn(
+      `${outstanding} announcements are already waiting for approval, so more are not being queued. ` +
+        "Clear some in this channel and the next reconcile will pick the rest up."
+    );
+    return;
+  }
+
+  const permalink = await permalinkFor(client, row.channelId, row.messageId);
+  try {
+    const posted = await client.chat.postMessage({
+      channel: CHANNELS.log,
+      text: `Hall of fame post held for approval — ${stars}⭐ ${permalink} (over ${limit})`,
+      blocks: [
+        {
+          type: "section",
+          text: {
+            type: "mrkdwn",
+            text:
+              `*Held for approval* — this qualifies with *${stars}*⭐ but posting it would go over the ` +
+              `limit of ${limit}.\n${permalink}`,
+          },
+        },
+        {
+          type: "actions",
+          elements: [
+            {
+              type: "button",
+              text: { type: "plain_text", text: "Post it", emoji: true },
+              style: "primary",
+              action_id: APPROVE_ACTION,
+              value: row.messageId,
+            },
+            {
+              type: "button",
+              text: { type: "plain_text", text: "Never", emoji: true },
+              style: "danger",
+              action_id: REJECT_ACTION,
+              value: row.messageId,
+            },
+          ],
+        },
+      ],
+    });
+    const ts = posted.ts as string | undefined;
+    // Recording the request ts is what stops it being asked again on every
+    // reconcile run. Without a ts there is nothing to record, so leave the row
+    // alone and let a later run re-ask.
+    if (ts) await db.setApprovalTs(row.messageId, ts);
+  } catch (err) {
+    log.error(`Could not post an approval request for ${permalink}`, err);
+  }
+}
+
+export const APPROVE_ACTION = "hof_approve";
+export const REJECT_ACTION = "hof_reject";
 
 // The `ts?: undefined` / `reason?: undefined` members are load-bearing: this
 // project compiles with strictNullChecks off, and TypeScript will not narrow a
@@ -48,26 +130,32 @@ export async function channelHasRoom(channelId: string): Promise<boolean> {
 // both members keeps them reachable without a cast.
 export type PostResult =
   | { posted: true; ts: string; reason?: undefined }
-  | { posted: false; ts?: undefined; reason: "claimed" | "throttled" | "skipped" | "failed" };
+  | { posted: false; ts?: undefined; reason: "claimed" | "queued" | "skipped" | "failed" };
 
 // Posts a new announcement for an origin message. Safe to call concurrently for
 // the same message: the row is claimed first, so of two simultaneous callers
 // exactly one posts and the other gets `claimed`.
 export async function postAnnouncement(
   client: WebClient,
-  row: { messageId: string; channelId: string; skip?: boolean },
+  row: { messageId: string; channelId: string; skip?: boolean; approvalTs?: string | null },
   stars: number,
   opts: { ignoreThrottle?: boolean } = {}
 ): Promise<PostResult> {
   if (row.skip) return { posted: false, reason: "skipped" };
 
-  if (!opts.ignoreThrottle && !(await channelHasRoom(row.channelId))) {
-    // Deliberately left as-is: still unposted, still eligible, so the next
-    // star event or reconcile run picks it up rather than losing it. The old
-    // code dropped throttled entries into a permanent hold-back, which
-    // systematically destroyed the overflow from exactly the busiest channels.
-    log.progress(`throttled: ${row.channelId}/${row.messageId} — ${RULES.maxPostsPerChannel} posts already in the last ${RULES.burstWindowMinutes}m`);
-    return { posted: false, reason: "throttled" };
+  // Already waiting on a human — don't ask twice.
+  if (!opts.ignoreThrottle && row.approvalTs) return { posted: false, reason: "queued" };
+
+  if (!opts.ignoreThrottle) {
+    const limit = await limitReached(row.channelId);
+    if (limit) {
+      // The row is deliberately left unposted and eligible. The old code dropped
+      // over-limit entries into a permanent hold-back, which systematically
+      // destroyed the overflow from exactly the busiest channels; now it becomes
+      // a question in the log channel instead.
+      await requestApproval(client, row, stars, limit);
+      return { posted: false, reason: "queued" };
+    }
   }
 
   if (!(await db.claimForPost(row.messageId, TIMING.claimTtlMs))) {

@@ -33,6 +33,10 @@ export interface MessageRow {
   stars: number;
   postedMessageId: string | null;
   skip: boolean;
+  // Timestamp of the approval request posted in the log channel, when this
+  // message hit a rate limit and is waiting on a human. Non-null means "already
+  // asked" — that is what stops it being asked about on every reconcile run.
+  approvalTs: string | null;
 }
 
 export interface StateRow {
@@ -108,7 +112,8 @@ export async function initSchema(): Promise<void> {
         "stars"           INTEGER NOT NULL DEFAULT 0,
         "postedMessageId" TEXT,
         "skip"            BOOLEAN NOT NULL DEFAULT false,
-        "claimedAt"       TIMESTAMPTZ
+        "claimedAt"       TIMESTAMPTZ,
+        "approvalTs"      TEXT
       );
       CREATE TABLE IF NOT EXISTS "AppState" (
         "id"              INTEGER PRIMARY KEY,
@@ -118,6 +123,7 @@ export async function initSchema(): Promise<void> {
 
       ALTER TABLE "Message"  ADD COLUMN IF NOT EXISTS "skip"            BOOLEAN NOT NULL DEFAULT false;
       ALTER TABLE "Message"  ADD COLUMN IF NOT EXISTS "claimedAt"       TIMESTAMPTZ;
+      ALTER TABLE "Message"  ADD COLUMN IF NOT EXISTS "approvalTs"      TEXT;
       ALTER TABLE "AppState" ADD COLUMN IF NOT EXISTS "scanCursor"      TEXT;
       ALTER TABLE "AppState" ADD COLUMN IF NOT EXISTS "lastReconcileAt" TIMESTAMPTZ;
 
@@ -165,7 +171,7 @@ export async function initSchema(): Promise<void> {
   }
 }
 
-const COLUMNS = "\"messageId\", \"channelId\", stars, \"postedMessageId\", skip";
+const COLUMNS = "\"messageId\", \"channelId\", stars, \"postedMessageId\", skip, \"approvalTs\"";
 
 export async function getMessage(messageId: string): Promise<MessageRow | undefined> {
   const rows = await query<MessageRow>(`SELECT ${COLUMNS} FROM "Message" WHERE "messageId" = $1`, [messageId]);
@@ -250,6 +256,30 @@ export async function postsInChannelSince(channelId: string, sinceSeconds: numbe
     `SELECT count(*) FROM "Message"
      WHERE "channelId" = $1 AND ${POSTED} AND "postedMessageId"::numeric >= $2`,
     [channelId, sinceSeconds]
+  );
+  return Number(rows[0]?.count ?? 0);
+}
+
+// How many announcements went into #hall-of-fame in the window, from any origin.
+// The global pace limit — counted on the announcement's own timestamp, so the age
+// of the starred message is irrelevant.
+export async function postsSince(sinceSeconds: number): Promise<number> {
+  const rows = await query<{ count: string }>(
+    `SELECT count(*) FROM "Message" WHERE ${POSTED} AND "postedMessageId"::numeric >= $1`,
+    [sinceSeconds]
+  );
+  return Number(rows[0]?.count ?? 0);
+}
+
+export async function setApprovalTs(messageId: string, approvalTs: string | null): Promise<void> {
+  await query("UPDATE \"Message\" SET \"approvalTs\" = $2 WHERE \"messageId\" = $1", [messageId, approvalTs]);
+}
+
+// Outstanding approval requests: asked for, not yet decided. A decision clears
+// approvalTs, whichever way it went.
+export async function pendingApprovals(): Promise<number> {
+  const rows = await query<{ count: string }>(
+    `SELECT count(*) FROM "Message" WHERE "approvalTs" IS NOT NULL AND ${NOT_POSTED}`
   );
   return Number(rows[0]?.count ?? 0);
 }

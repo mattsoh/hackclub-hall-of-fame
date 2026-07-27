@@ -12,8 +12,13 @@ change any of this.
 - **The author's own star never counts.** Enforced in `starCount()`
   ([`src/slack.ts`](src/slack.ts)), which every path reads counts through, so a
   message needs five stars from other people.
-- **At most 3 announcements per channel per 5 minutes**, so one busy channel
-  can't take over the feed.
+- **At most 3 announcements per hour** in #hall-of-fame overall, and **10 per
+  channel per day**. Both count when the announcement was *posted*, not how old
+  the starred message is.
+- **Nothing is dropped for hitting a pace limit.** It's posted in the log channel
+  with *Post it* / *Never* buttons instead, so a person decides. *Post it*
+  re-checks the live star count and then posts regardless of the limit; *Never*
+  sets `skip`, which also holds against the live handler.
 - **A reconcile only auto-posts messages younger than 24 hours, at most 10 per
   run.** This is what stops a restart replaying a backlog into the channel — see
   below.
@@ -29,7 +34,7 @@ landing on an old message today is a real, organic entry.
 
 The reconciler is different: it looks at what the bot *missed*, so it only posts
 origins younger than `RULES.catchUpWindowHours` (24h), capped at
-`RULES.maxCatchUpPostsPerRun` (10) per run and 3 per channel. Anything older that
+`RULES.maxCatchUpPostsPerRun` (10) per run. Anything older that
 qualifies is recorded with its correct star count and simply not posted; the run
 summary says how many. A week of downtime therefore costs at most 10 posts, not a
 week's worth.
@@ -103,6 +108,11 @@ channel, since they surface internal state and can trigger real posts.
 `/ninja-check` and `/ninja-sync` still work as aliases for `check` and
 `reconcile`.
 
+Held-for-approval messages also appear here, each with *Post it* and *Never*
+buttons. Either choice removes the buttons and rewrites the message to record who
+decided. At most 20 can be outstanding at once — past that the bot stops asking,
+logs a warning, and leaves the rest for a later reconcile.
+
 ## Logging
 
 Everything logs through [`src/log.ts`](src/log.ts): `log.info`, `log.warn`,
@@ -120,9 +130,9 @@ one per event.
 | `log.ts` | the logger |
 | `db.ts` | schema + every SQL query (two tables) |
 | `slack.ts` | Slack calls and how to read a star count off a message |
-| `policy.ts` | the rules, and the only three functions that write to #hall-of-fame |
+| `policy.ts` | the rules, and the only functions that write to #hall-of-fame |
 | `reconcile.ts` | the accuracy job |
 | `scan.ts` | "what's starred in this channel right now" |
 | `status.ts` | the status view |
-| `events/` | reactions, deletions, channel joins, slash commands |
+| `events/` | reactions, deletions, channel joins, slash commands, approval buttons |
 | `cli.ts` | the `hof` command |

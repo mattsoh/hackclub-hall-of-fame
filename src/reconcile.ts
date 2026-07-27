@@ -4,8 +4,8 @@
 //
 // The rule that makes this safe to run automatically — and the reason a restart
 // can no longer spam the channel — is that it only posts an origin younger than
-// RULES.catchUpWindowHours, at most RULES.maxCatchUpPostsPerRun per run, at most
-// RULES.maxPostsPerChannel per channel. Everything older that qualifies is
+// RULES.catchUpWindowHours, and deals with at most RULES.maxCatchUpPostsPerRun
+// messages per run. Everything older that qualifies is
 // recorded with its true star count and left alone. That decision is re-derived
 // from each message's timestamp every run, so unlike the `announce = false` flag
 // it replaces, it cannot be written down wrongly and cannot permanently retire
@@ -341,31 +341,43 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
   );
 
   let announced = 0;
-  let throttled = 0;
+  let queued = 0;
+  let deferred = 0;
   for (const candidate of fresh) {
-    if (announced >= RULES.maxCatchUpPostsPerRun) {
-      throttled += fresh.length - announced - throttled;
+    const link = permalinkOf(candidate.row.channelId, candidate.row.messageId);
+    // The per-run ceiling counts posts and approval requests together: both cost
+    // a human's attention, and a large backlog shouldn't become a large pile of
+    // buttons. The remainder is left untouched and is eligible again next run.
+    if (announced + queued >= RULES.maxCatchUpPostsPerRun) {
+      deferred = fresh.length - announced - queued;
       break;
     }
     if (dry) {
-      details.push(`would announce: ${candidate.stars}⭐ ${permalinkOf(candidate.row.channelId, candidate.row.messageId)}`);
+      details.push(`would post or queue: ${candidate.stars}⭐ ${link}`);
       announced++;
       continue;
     }
     const result = await postAnnouncement(client, candidate.row, candidate.stars);
     if (result.posted) {
       announced++;
-      details.push(`announced: ${candidate.stars}⭐ ${permalinkOf(candidate.row.channelId, candidate.row.messageId)}`);
+      details.push(`announced: ${candidate.stars}⭐ ${link}`);
       await delay(TIMING.slackPostDelayMs);
-    } else if (result.reason === "throttled") {
-      throttled++;
+    } else if (result.reason === "queued") {
+      queued++;
+      details.push(`queued for approval: ${candidate.stars}⭐ ${link}`);
     }
   }
 
   // ---- Summary -----------------------------------------------------------
   const minutes = Math.round((Date.now() - startedAt) / 60000);
   const changed =
-    recorded > 0 || humanDeleted > 0 || corrected > 0 || announced > 0 || lookupErrors > 0 || warnings.length > 0;
+    recorded > 0 ||
+    humanDeleted > 0 ||
+    corrected > 0 ||
+    announced > 0 ||
+    queued > 0 ||
+    lookupErrors > 0 ||
+    warnings.length > 0;
 
   lines.push(`*Reconcile*${dry ? " (dry run — nothing was written or posted)" : ""} — ${minutes} min`);
   lines.push(`• announcements in channel: ${announcements.length}, tracked messages: ${posted.length + unposted.length}`);
@@ -386,7 +398,8 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
         "(recorded with the right count; `hof post <link>` to announce one deliberately)"
     );
   }
-  if (throttled > 0) lines.push(`• held for the next run (per-run or per-channel limit): ${throttled}`);
+  if (queued > 0) lines.push(`• queued for approval here (over a pace limit): ${queued} — see thread`);
+  if (deferred > 0) lines.push(`• left for the next run (over the ${RULES.maxCatchUpPostsPerRun}-per-run ceiling): ${deferred}`);
   if (lookupErrors > 0) {
     const breakdown = [...errorReasons.entries()].sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}: ${n}`).join(", ");
     lines.push(`• star lookups that failed: ${lookupErrors} (${breakdown})`);

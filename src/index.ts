@@ -2,6 +2,7 @@ import { App, ExpressReceiver } from "@slack/bolt";
 import { PORT, TIMING, requireEnv } from "./config";
 import * as db from "./db";
 import { log } from "./log";
+import { registerApprovalActions } from "./events/approvals";
 import { registerChannelEvents } from "./events/channel";
 import { registerCommands } from "./events/commands";
 import { registerMessageEvents } from "./events/messages";
@@ -68,6 +69,7 @@ async function main(): Promise<void> {
   registerMessageEvents(app);
   registerChannelEvents(app);
   registerCommands(app);
+  registerApprovalActions(app);
 
   await app.start(PORT);
   log.info(`Hall of Fame started on port ${PORT}.`);

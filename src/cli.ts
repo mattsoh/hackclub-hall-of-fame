@@ -21,6 +21,7 @@
 //   hof reconcile [--apply]             fix drift, post what was missed (dry by default)
 //   hof post <permalink>… --apply       announce specific messages, ignoring the age rule
 //   hof skip|unskip <permalink>…        never / do announce these
+//   hof migrate                         create/upgrade the schema (the app also does this at boot)
 
 import { WebClient } from "@slack/web-api";
 import { RULES, SCAN, TIMING, requireEnv } from "./config";
@@ -216,11 +217,13 @@ const USAGE = `hof <command>
   post <permalink>… [--apply]       announce specific messages, overriding the age rule and any skip
   skip <permalink>…                 never announce these
   unskip <permalink>…               allow announcing these again
+  migrate                           create or upgrade the database schema
 `;
 
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
-  const needsSlack = args.verb !== "status" && args.verb !== "skip" && args.verb !== "unskip";
+  const localOnly = ["status", "skip", "unskip", "migrate"];
+  const needsSlack = !localOnly.includes(args.verb);
   requireEnv(needsSlack ? ["SLACK_BOLT_TOKEN", "DATABASE_URL"] : ["DATABASE_URL"]);
 
   const client = new WebClient(process.env.SLACK_BOLT_TOKEN);

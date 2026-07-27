@@ -29,11 +29,21 @@ export const RULES = {
   // toward this — see starCount() in policy.ts.
   starThreshold: 5,
 
-  // No more than this many announcements from a single channel inside
-  // burstWindowMinutes. Stops one busy channel taking over the feed. Applied
-  // identically by the live handler and the reconciler.
-  maxPostsPerChannel: 3,
-  burstWindowMinutes: 5,
+  // Two rate limits on #hall-of-fame itself. Both count by *when the
+  // announcement was posted*, never by how old the starred message is — the
+  // point is to pace the channel's own feed, so a message from last week and one
+  // from a minute ago consume the limit identically.
+  //
+  // Nothing is discarded for hitting a limit. The message is queued for approval
+  // in the log channel with Approve / Never buttons instead, so the decision is
+  // a human's rather than a silent drop. See requestApproval() in policy.ts.
+  maxPerHour: 3, // across the whole channel, all origins
+  maxPerChannelPerDay: 10, // per origin channel
+
+  // Backstop on the approval queue. A pathological burst should ask a human a
+  // few times and then stop asking, not fill the log channel with buttons —
+  // whatever is left stays unposted and the next reconcile finds it again.
+  maxPendingApprovals: 20,
 
   // The anti-restart-spam rule, and the reason it is an age test rather than a
   // stored flag. The live handler posts a qualifying message whenever it sees
@@ -49,9 +59,10 @@ export const RULES = {
   // ever being posted — so every outage became a permanent loss.
   catchUpWindowHours: 24,
 
-  // Absolute ceiling on announcements one reconcile run may post, on top of
-  // the per-channel limit. A week of downtime therefore costs at most this
-  // many posts, not a week's worth.
+  // Ceiling on how many messages one reconcile run will deal with at all —
+  // posted plus queued for approval. Stops a run that finds a large backlog from
+  // turning it into a large pile of buttons. Whatever is left over is untouched
+  // and still eligible next run.
   maxCatchUpPostsPerRun: 10,
 };
 

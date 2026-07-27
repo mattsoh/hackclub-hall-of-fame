@@ -14,6 +14,7 @@ function ago(at: Date | null): string {
 export async function statusLines(): Promise<string[]> {
   const counts = await db.counts(RULES.starThreshold);
   const { lastReconcileAt } = await db.getState();
+  const awaitingApproval = await db.pendingApprovals();
 
   return [
     "*Hall of Fame status*",
@@ -21,8 +22,10 @@ export async function statusLines(): Promise<string[]> {
     `• at or above ${RULES.starThreshold}⭐ and not announced: ${counts.atThreshold}`,
     `• skipped by hand or by moderation: ${counts.skipped}`,
     `• last reconcile: ${ago(lastReconcileAt)} (runs every ${Math.round(TIMING.reconcileIntervalMs / 3600000)}h)`,
-    `• rules: ${RULES.starThreshold}⭐ threshold, the author's own star never counts, ` +
-      `at most ${RULES.maxPostsPerChannel} per channel per ${RULES.burstWindowMinutes} min`,
+    `• rules: ${RULES.starThreshold}⭐ threshold, the author's own star never counts`,
+    `• pace: at most ${RULES.maxPerHour} posts per hour overall, and ${RULES.maxPerChannelPerDay} per channel ` +
+      "per day — anything over a limit is queued for approval here rather than dropped",
+    `• waiting for approval right now: ${awaitingApproval}`,
     `• catch-up: only messages younger than ${RULES.catchUpWindowHours}h are auto-posted by a reconcile, ` +
       `at most ${RULES.maxCatchUpPostsPerRun} per run — so a restart can't replay a backlog`,
     `• messages older than ${SCAN.maxMessageAgeDays} days are not tracked at all`,
