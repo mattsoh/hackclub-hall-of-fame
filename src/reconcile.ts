@@ -225,10 +225,31 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
   // announcement that isn't in the channel was removed by a person. Skip is set
   // so the next star on that message doesn't quietly undo the moderation.
   const announcementTsSet = new Set(announcements.map((a) => a.ts));
+  const announcementByOrigin = new Map(announcements.filter((a) => a.originTs).map((a) => [a.originTs as string, a]));
   let humanDeleted = 0;
+  let repointed = 0;
   if (!truncated) {
     for (const row of posted) {
       if (announcementTsSet.has(row.postedMessageId as string)) continue;
+
+      // The copy this row points at is gone, but another announcement for the
+      // same origin is still in the channel — the channel holds 363 duplicates,
+      // so deleting one of a pair is common. The message is still in the hall of
+      // fame, so nothing was moderated away: re-point at the survivor instead of
+      // calling it deleted.
+      //
+      // Getting this wrong doesn't just mislabel it. Clearing the link here would
+      // undo the backfill phase above, which had just recorded that survivor, and
+      // the next run would record it again — the exact postedMessageId
+      // oscillation the old sync job suffered, where each run swapped the link
+      // between two copies of the same announcement in perpetuity.
+      const survivor = announcementByOrigin.get(row.messageId);
+      if (survivor) {
+        if (!dry) await db.recordAnnounced(row.messageId, row.channelId, survivor.stars, survivor.ts);
+        repointed++;
+        continue;
+      }
+
       if (!dry) {
         await db.clearPosted(row.messageId);
         await db.setSkip(row.messageId, true);
@@ -239,16 +260,16 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
       }
     }
     run.step(
-      humanDeleted > 0
+      (humanDeleted > 0
         ? `${humanDeleted} announcement(s) were deleted by hand — clearing their links and marking them skipped`
-        : "no announcements were deleted by hand"
+        : "no announcements were deleted by hand") +
+        (repointed > 0 ? `; ${repointed} re-pointed at a surviving duplicate` : "")
     );
   }
 
   // ---- Live star check ---------------------------------------------------
   const state = await db.getState();
   const selection = selectToCheck([...posted, ...unposted], state.scanCursor ?? "");
-  const announcementByOrigin = new Map(announcements.filter((a) => a.originTs).map((a) => [a.originTs as string, a]));
 
   // A floor, not an estimate: measured runs come in around 1.5x this, because
   // some calls still hit a 429 and wait out the WebClient's own retry on top of
@@ -373,6 +394,7 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
   const changed =
     recorded > 0 ||
     humanDeleted > 0 ||
+    repointed > 0 ||
     corrected > 0 ||
     announced > 0 ||
     queued > 0 ||
@@ -388,6 +410,7 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
   if (recorded > 0) lines.push(`• recorded announcements the database had lost: ${recorded}`);
   if (duplicates > 0) lines.push(`• duplicate announcements in the channel (same origin announced twice): ${duplicates}`);
   if (humanDeleted > 0) lines.push(`• announcements deleted by hand (now skipped, won't be reposted): ${humanDeleted}`);
+  if (repointed > 0) lines.push(`• re-pointed at a surviving duplicate announcement: ${repointed}`);
   if (uneditable > 0) {
     lines.push(`• un-editable (posted by an earlier install of this app; database corrected, channel text stays stale): ${uneditable}`);
   }

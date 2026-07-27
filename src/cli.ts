@@ -237,6 +237,13 @@ async function main(): Promise<void> {
   // sentence came to be written.
   try {
     switch (args.verb) {
+    case "migrate":
+      // The one command that may change the schema, and it says so in its name.
+      // Everything else assumes the app has already done it at boot, so a
+      // read-only command can never quietly run ALTER TABLE.
+      await db.initSchema();
+      console.log("Schema is up to date.");
+      break;
     case "status":
       await cmdStatus();
       break;
@@ -269,6 +276,17 @@ async function main(): Promise<void> {
 }
 
 main().catch((err) => {
-  console.error(err);
+  // 42703 undefined_column / 42P01 undefined_table mean the schema is older than
+  // this build. Since the CLI deliberately never migrates on its own, that needs
+  // saying in one line rather than as a Postgres stack trace.
+  const code = (err as { code?: string })?.code;
+  if (code === "42703" || code === "42P01") {
+    console.error(
+      `The database schema is out of date (${(err as Error).message}).\n` +
+        "Run `yarn hof migrate` — or just deploy, since the app migrates at boot."
+    );
+  } else {
+    console.error(err);
+  }
   process.exit(1);
 });
