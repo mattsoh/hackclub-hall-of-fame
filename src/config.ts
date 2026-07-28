@@ -141,6 +141,29 @@ export const LOGGING = {
   maxMessageChars: 3500,
 };
 
+// Mirroring the *content* of a message the bot acts on into the log channel.
+//
+// #hall-of-fame only ever gets `⭐ N` and a permalink, and a good share of
+// origins are private channels — the bot is a member of those too, and nothing
+// in the rules excludes them. So an announcement is frequently a link that the
+// reader cannot open, and an approval request asks a human to decide about a
+// message they cannot see. Both are fixed by putting the text in the log
+// channel.
+//
+// The log channel and nowhere else, deliberately. It is private, it already
+// carries the bot's internal state, and #hall-of-fame keeps its bare-permalink
+// format so this never widens who can read an origin message.
+export const FORWARD = {
+  // FORWARD_TO_LOG=false turns it off without a code change.
+  enabled: process.env.FORWARD_TO_LOG !== "false",
+  // Longest rendering of one message's content. Slack's limit is far higher;
+  // this is about the log channel staying readable.
+  maxContentChars: 1200,
+  // Emailed-in and snippet files carry their whole body inline in the file
+  // object, so they need their own cap before the overall one.
+  maxFileTextChars: 500,
+};
+
 export const PORT = Number(process.env.PORT) || 3000;
 
 // Checked all at once at boot so a fresh deployment reports everything that is
