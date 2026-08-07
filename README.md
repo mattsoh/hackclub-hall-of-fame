@@ -19,13 +19,6 @@ change any of this.
   with *Post it* / *Never* buttons instead, so a person decides. *Post it*
   re-checks the live star count and then posts regardless of the limit; *Never*
   sets `skip`, which also holds against the live handler.
-- **Some channels always ask.** Anything from a channel in
-  `RULES.manualApprovalChannels` — currently just
-  [#confessions](https://hackclub.slack.com/archives/CNMU9L92Q) — is never
-  announced automatically, however many stars it has. It takes the same route an
-  over-limit message takes: buttons in the log channel, and nothing reaches
-  #hall-of-fame until somebody presses one. Only the two things that already mean
-  "a human said so" bypass it — the *Post it* button and `hof post`.
 - **A reconcile only auto-posts messages younger than 24 hours, at most 10 per
   run.** This is what stops a restart replaying a backlog into the channel — see
   below.
@@ -98,7 +91,7 @@ yarn hof check '#some-channel'        # what's starred there right now, and why 
 yarn hof pending                      # messages that qualify on the live count but aren't announced
 yarn hof reconcile                    # dry run: what a reconcile would change
 yarn hof reconcile --apply            # actually do it
-yarn hof post <permalink> --apply     # announce a specific message, overriding the age and approval rules
+yarn hof post <permalink> --apply     # announce a specific message, overriding the age rule
 yarn hof skip <permalink>             # never announce this
 yarn hof unskip <permalink>           # allow it again
 ```
@@ -116,8 +109,7 @@ channel, since they surface internal state and can trigger real posts.
 `reconcile`.
 
 Held-for-approval messages also appear here, each with *Post it* and *Never*
-buttons — both the ones over a pace limit and everything from an approval-only
-channel. Either choice removes the buttons and rewrites the message to record who
+buttons. Either choice removes the buttons and rewrites the message to record who
 decided. At most 20 can be outstanding at once — past that the bot stops asking,
 logs a warning, and leaves the rest for a later reconcile.
 

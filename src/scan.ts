@@ -8,9 +8,9 @@
 
 import type { WebClient } from "@slack/web-api";
 import * as db from "./db";
-import { CHANNELS, RULES, SCAN, TIMING } from "./config";
+import { RULES, SCAN, TIMING } from "./config";
 import { delay, fetchHistory, hasStar, permalinkOf, starCount, tsSeconds } from "./slack";
-import { needsManualApproval, withinCatchUpWindow } from "./policy";
+import { withinCatchUpWindow } from "./policy";
 
 export interface Candidate {
   ts: string;
@@ -99,15 +99,6 @@ export async function explain(channelId: string, candidates: Candidate[]): Promi
     if (row.skip) return `${link} — ${live}${drift}, not announced (skipped — use \`hof unskip\` to allow)`;
     if (candidate.stars < RULES.starThreshold) {
       return `${link} — ${live}${drift}, below the ${RULES.starThreshold}⭐ threshold`;
-    }
-    if (row.approvalTs) {
-      return `${link} — ${live}${drift}, *waiting for approval* (Post it / Never in <#${CHANNELS.log}>)`;
-    }
-    if (needsManualApproval(channelId)) {
-      return (
-        `${link} — ${live}${drift}, *qualifies, needs approval* ` +
-        `(nothing from this channel posts on its own — it will be queued in <#${CHANNELS.log}>)`
-      );
     }
     if (!withinCatchUpWindow(candidate.ts)) {
       return (

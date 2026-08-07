@@ -1,9 +1,8 @@
 // The rules, and the only functions that write to #hall-of-fame.
 //
 // Every posting path goes through postAnnouncement, so the star threshold, the
-// author-star exclusion, both pace limits and the approval-only channels are
-// applied identically whether the trigger was a live reaction, a reconcile
-// catch-up or a hand-run CLI command.
+// author-star exclusion and both pace limits are applied identically whether the
+// trigger was a live reaction, a reconcile catch-up or a hand-run CLI command.
 // Previously there were five posting paths: two of them applied a rate limit, two
 // of them excluded the author's own star, and they wrote three different values
 // for the `announce` flag.
@@ -56,37 +55,14 @@ export async function limitReached(channelId: string): Promise<string | undefine
   return undefined;
 }
 
-// Channels where a person signs off on every announcement, regardless of pace.
-export function needsManualApproval(channelId: string): boolean {
-  return RULES.manualApprovalChannels.includes(channelId);
-}
-
-// Why this message can't be announced on its own, if it can't — the single gate
-// in front of every automatic post. Returned as the phrase that completes
-// "…qualifies, but ___", so the approval request reads the same whichever rule
-// held it.
-//
-// The channel rule is checked first, and without touching the database: the
-// answer doesn't depend on how busy #hall-of-fame is, and "over a pace limit"
-// would be the wrong thing to tell a human about a #confessions post, since
-// waiting for a quieter hour would not make it postable.
-export async function holdReason(channelId: string): Promise<string | undefined> {
-  if (needsManualApproval(channelId)) {
-    return `everything from <#${channelId}> is announced only after a person approves it`;
-  }
-  const limit = await limitReached(channelId);
-  return limit && `posting it now would go over the limit of ${limit}`;
-}
-
-// Asks in the log channel instead of dropping the message. Nothing that reaches
-// here has been judged unworthy — it either hit a pace limit, which only means
-// the channel is busy, or it came from a channel that always asks — so the
-// decision belongs to a person, and it stays queued until they make one.
+// Asks in the log channel instead of dropping the message. Hitting a pace limit
+// is not a judgement about the message — it just means the channel is busy — so
+// the decision belongs to a person, and it stays queued until they make one.
 async function requestApproval(
   client: WebClient,
   row: { messageId: string; channelId: string },
   stars: number,
-  reason: string
+  limit: string
 ): Promise<void> {
   const outstanding = await db.pendingApprovals();
   if (outstanding >= RULES.maxPendingApprovals) {
@@ -118,8 +94,7 @@ async function requestApproval(
             type: "mrkdwn",
             text:
               `*Held for approval* — this qualifies with *${stars}*⭐ but posting it would go over the ` +
-              `limit of ${limit}.\n${content}`,
-            text: `*Held for approval* — this qualifies with *${stars}*⭐, but ${reason}.\n${permalink}`,
+              `limit of ${limit}.\n${permalink}`,
           },
         },
         {
@@ -179,13 +154,13 @@ export async function postAnnouncement(
   if (!opts.ignoreThrottle && row.approvalTs) return { posted: false, reason: "queued" };
 
   if (!opts.ignoreThrottle) {
-    const hold = await holdReason(row.channelId);
-    if (hold) {
+    const limit = await limitReached(row.channelId);
+    if (limit) {
       // The row is deliberately left unposted and eligible. The old code dropped
       // over-limit entries into a permanent hold-back, which systematically
       // destroyed the overflow from exactly the busiest channels; now it becomes
       // a question in the log channel instead.
-      await requestApproval(client, row, stars, hold);
+      await requestApproval(client, row, stars, limit);
       return { posted: false, reason: "queued" };
     }
   }

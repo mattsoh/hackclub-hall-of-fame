@@ -25,11 +25,6 @@ export async function statusLines(): Promise<string[]> {
     `• rules: ${RULES.starThreshold}⭐ threshold, the author's own star never counts`,
     `• pace: at most ${RULES.maxPerHour} posts per hour overall, and ${RULES.maxPerChannelPerDay} per channel ` +
       "per day — anything over a limit is queued for approval here rather than dropped",
-    `• always queued for approval, however many stars: ${
-      RULES.manualApprovalChannels.length > 0
-        ? RULES.manualApprovalChannels.map((id) => `<#${id}>`).join(", ")
-        : "no channels"
-    }`,
     `• waiting for approval right now: ${awaitingApproval}`,
     `• catch-up: only messages younger than ${RULES.catchUpWindowHours}h are auto-posted by a reconcile, ` +
       `at most ${RULES.maxCatchUpPostsPerRun} per run — so a restart can't replay a backlog`,

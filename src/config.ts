@@ -40,18 +40,6 @@ export const RULES = {
   maxPerHour: 3, // across the whole channel, all origins
   maxPerChannelPerDay: 10, // per origin channel
 
-  // Origin channels whose messages are never announced automatically, however
-  // many stars they have. They take the same route an over-limit message takes
-  // — Post it / Never buttons in the log channel — so the decision is always a
-  // person's. #confessions is here because a message can be popular there and
-  // still be something nobody wants amplified into #hall-of-fame under its
-  // author's name.
-  //
-  // This gate is the same one the pace limits use, so it is bypassed by exactly
-  // the two things that already mean "a human said so": the Post it button and
-  // `hof post`.
-  manualApprovalChannels: ["CNMU9L92Q"], // #confessions
-
   // Backstop on the approval queue. A pathological burst should ask a human a
   // few times and then stop asking, not fill the log channel with buttons —
   // whatever is left stays unposted and the next reconcile finds it again.

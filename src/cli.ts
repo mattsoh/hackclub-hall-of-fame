@@ -19,7 +19,7 @@
 //   hof check <#channel> [--hours N]    what's starred in a channel right now
 //   hof pending [--hours N|--all]       messages that qualify but aren't announced
 //   hof reconcile [--apply]             fix drift, post what was missed (dry by default)
-//   hof post <permalink>… --apply       announce specific messages, ignoring the age and approval rules
+//   hof post <permalink>… --apply       announce specific messages, ignoring the age rule
 //   hof skip|unskip <permalink>…        never / do announce these
 //   hof migrate                         create/upgrade the schema (the app also does this at boot)
 
@@ -28,7 +28,7 @@ import { RULES, SCAN, TIMING, requireEnv } from "./config";
 import * as db from "./db";
 import { log } from "./log";
 import { announcementText, delay, liveStars, parsePermalink, permalinkOf, tsSeconds } from "./slack";
-import { needsManualApproval, postAnnouncement, qualifies } from "./policy";
+import { postAnnouncement, qualifies } from "./policy";
 import { runReconcile } from "./reconcile";
 import { explain, scanChannel } from "./scan";
 import { statusLines } from "./status";
@@ -125,13 +125,7 @@ async function cmdPending(client: WebClient, args: Args): Promise<void> {
     if (!qualifies(live.stars)) continue;
     found++;
     const ageH = Math.round((Date.now() / 1000 - tsSeconds(row.messageId)) / 3600);
-    const eligible = needsManualApproval(row.channelId)
-      ? row.approvalTs
-        ? "waiting for someone to approve it in the log channel"
-        : "needs approval — it will be queued in the log channel, never posted automatically"
-      : ageH <= RULES.catchUpWindowHours
-        ? "will be announced by the next reconcile"
-        : `too old to auto-post (${ageH}h) — \`hof post\` to force`;
+    const eligible = ageH <= RULES.catchUpWindowHours ? "will be announced by the next reconcile" : `too old to auto-post (${ageH}h) — \`hof post\` to force`;
     const drift = live.stars !== row.stars ? ` (recorded ${row.stars}⭐)` : "";
     console.log(`  ${live.stars}⭐${drift} ${permalinkOf(row.channelId, row.messageId)} — ${eligible}`);
   }
@@ -145,9 +139,8 @@ async function cmdReconcile(client: WebClient, args: Args): Promise<void> {
   await runReconcile(client, { dry: !args.apply });
 }
 
-// Announces specific messages, named one at a time. This overrides the age
-// rule, any skip, and the approval-only channel list, because naming a
-// permalink IS the human approval those rules exist to require — but it still
+// Announces specific messages, named one at a time. This overrides the age rule
+// and any skip, because naming a permalink is a deliberate act — but it still
 // verifies the live star count first, so it can never post a number that isn't
 // real, and it will not touch a message that already has an announcement.
 async function cmdPost(client: WebClient, args: Args): Promise<void> {
@@ -221,7 +214,7 @@ const USAGE = `hof <command>
   check <#channel> [--hours=N]      what is starred in a channel right now, and why
   pending [--hours=N|--all]         messages that qualify on the live count but aren't announced
   reconcile [--apply]               fix drifted counts and post what was missed (dry run by default)
-  post <permalink>… [--apply]       announce specific messages, overriding the age, skip and approval rules
+  post <permalink>… [--apply]       announce specific messages, overriding the age rule and any skip
   skip <permalink>…                 never announce these
   unskip <permalink>…               allow announcing these again
   migrate                           create or upgrade the database schema

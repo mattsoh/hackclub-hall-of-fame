@@ -1,11 +1,10 @@
 // The buttons on a held-for-approval message.
 //
-// A message gets held for one of two reasons: posting it would exceed one of the
-// two pace limits in RULES, or it came from one of RULES.manualApprovalChannels,
-// where nothing is ever announced without a person saying so. Neither is a
-// judgement the bot can make on its own, so rather than dropping the message it
-// asks. Either button resolves the request for good: the buttons are removed and
-// the message is rewritten to record who decided what.
+// A message gets held when posting it would exceed one of the two pace limits in
+// RULES. Hitting a limit says nothing about the message itself — only that the
+// channel is busy — so rather than dropping it, the bot asks. Either button
+// resolves the request for good: the buttons are removed and the message is
+// rewritten to record who decided what.
 
 import type { App } from "@slack/bolt";
 import * as db from "../db";
