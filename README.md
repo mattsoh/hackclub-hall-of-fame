@@ -130,6 +130,41 @@ counted rather than reposted, and **only errors ping** — and only the first on
 the window, so a repeating failure costs one @-mention per 15 minutes rather than
 one per event.
 
+## Reading messages from the log channel
+
+#hall-of-fame holds nothing but `⭐ N` and a permalink, and the bot is a member of
+private channels as well as public ones — so a good share of announcements are
+links that most readers can't open, and an approval request was asking a human to
+decide about a message they couldn't see. So the *content* of every message the
+bot acts on is now written to the log channel:
+
+- **Announced** messages get a forward — author, origin channel, and the text.
+- **Held-for-approval** messages carry the same rendering inline, above the
+  *Post it* / *Never* buttons, so the decision is made with the message in view.
+- A **private** origin channel is labelled as such, since that's the reason the
+  permalink next to it doesn't work.
+
+It reads more than `text`, deliberately: an emailed-in message has an empty
+`text` and carries its whole body in `files[].plain_text`, and an app's message
+carries it in `attachments[]`. Reading `text` alone rendered a lot of real
+entries as blank. Broadcast mentions are defused first (`<!channel>` becomes
+plain `@channel`) — forwarding one verbatim would @-mention the log channel once
+per forward. `<@user>` and `<#channel>` are left alone, since they render as
+names.
+
+**The log channel and nowhere else.** #hall-of-fame keeps its bare-permalink
+format, so this never widens who can read an origin message: the log channel is
+private, and anyone in it already has the bot's internal state and its admin
+commands. `FORWARD_TO_LOG=false` turns it off.
+
+This is scoped to messages the bot **already acts on** — at most a handful an
+hour, bounded by the pace limits in `RULES`. It is not a mirror of the workspace,
+and shouldn't become one: the bot is in ~3,800 channels including private ones,
+so forwarding every message it can see would copy other people's private
+conversations into a channel they can't see, and at `chat.postMessage`'s ~1
+message/second it would fall permanently behind while rate-limiting the bot out
+of its actual job.
+
 ## Layout
 
 | File | What's in it |
@@ -139,6 +174,7 @@ one per event.
 | `db.ts` | schema + every SQL query (two tables) |
 | `slack.ts` | Slack calls and how to read a star count off a message |
 | `policy.ts` | the rules, and the only functions that write to #hall-of-fame |
+| `forward.ts` | copying a message's content into the log channel |
 | `reconcile.ts` | the accuracy job |
 | `scan.ts` | "what's starred in this channel right now" |
 | `status.ts` | the status view |

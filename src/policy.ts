@@ -10,8 +10,9 @@
 
 import type { WebClient } from "@slack/web-api";
 import * as db from "./db";
-import { CHANNELS, RULES, SCAN, TIMING } from "./config";
+import { CHANNELS, FORWARD, RULES, SCAN, TIMING } from "./config";
 import { announcementText, ageHours, delay, describeError, isPermanent, permalinkFor } from "./slack";
+import { describeMessage, forwardAnnouncement } from "./forward";
 import { log } from "./log";
 
 export function qualifies(stars: number): boolean {
@@ -100,15 +101,24 @@ async function requestApproval(
   }
 
   const permalink = await permalinkFor(client, row.channelId, row.messageId);
+
+  // The content of the message, not just a link to it. A held message is the one
+  // place a human is asked to make a judgement, and a permalink into a private
+  // channel they aren't in gives them nothing to judge.
+  const content = FORWARD.enabled ? await describeMessage(client, row, permalink) : permalink;
+
   try {
     const posted = await client.chat.postMessage({
       channel: CHANNELS.log,
-      text: `Hall of fame post held for approval — ${stars}⭐ ${permalink} (${reason})`,
+      text: `Hall of fame post held for approval — ${stars}⭐ ${permalink} (over ${limit})`,
       blocks: [
         {
           type: "section",
           text: {
             type: "mrkdwn",
+            text:
+              `*Held for approval* — this qualifies with *${stars}*⭐ but posting it would go over the ` +
+              `limit of ${limit}.\n${content}`,
             text: `*Held for approval* — this qualifies with *${stars}*⭐, but ${reason}.\n${permalink}`,
           },
         },
@@ -209,6 +219,11 @@ export async function postAnnouncement(
     log.error(`Slack accepted the announcement for ${permalink} but returned no timestamp — not recorded`);
     return { posted: false, reason: "failed" };
   }
+
+  // Before the record loop, so it happens exactly once per announcement whichever
+  // way that loop exits. #hall-of-fame has the permalink; this is the only place
+  // the message's own text is written down.
+  await forwardAnnouncement(client, row, stars, permalink);
 
   // The announcement now exists in the channel, so failing to write it down is
   // what produces duplicates — the next star event would post a second copy.
