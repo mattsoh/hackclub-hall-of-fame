@@ -9,7 +9,7 @@
 
 import type { WebClient } from "@slack/web-api";
 import * as db from "./db";
-import { CHANNELS, FORWARD, RULES, SCAN, TIMING } from "./config";
+import { BLACKLISTED_CHANNELS, CHANNELS, FORWARD, RULES, SCAN, TIMING } from "./config";
 import { announcementText, ageHours, delay, describeError, isPermanent, permalinkFor } from "./slack";
 import { describeMessage, forwardAnnouncement } from "./forward";
 import { log } from "./log";
@@ -149,6 +149,8 @@ export async function postAnnouncement(
   stars: number,
   opts: { ignoreThrottle?: boolean } = {}
 ): Promise<PostResult> {
+  if (BLACKLISTED_CHANNELS.has(row.channelId)) return { posted: false, reason: "skipped" };
+
   if (row.skip) return { posted: false, reason: "skipped" };
 
   // Already waiting on a human — don't ask twice.

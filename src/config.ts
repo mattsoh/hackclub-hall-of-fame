@@ -16,6 +16,18 @@ export const CHANNELS = {
   log: "C0AR0NB4UQ1",
 };
 
+// Origin channels whose messages must NEVER reach the hall of fame.
+// Keyed on Slack channel IDs (not names). Populate via the
+// BLACKLISTED_CHANNELS env var (comma-separated IDs) and/or the
+// hardcoded list below.
+export const BLACKLISTED_CHANNELS = new Set<string>([
+  // "CXXXXXXXX", // #confessions — TODO: fill in the real channel ID
+  ...(process.env.BLACKLISTED_CHANNELS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
+]);
+
 // Pinged on errors. Not a display name anywhere — only ever used as <@id>.
 export const ADMIN_USER = "U07DPHQCCCS";
 

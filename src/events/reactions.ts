@@ -10,7 +10,7 @@
 import type { App } from "@slack/bolt";
 import type { WebClient } from "@slack/web-api";
 import * as db from "../db";
-import { CHANNELS, RULES } from "../config";
+import { BLACKLISTED_CHANNELS, CHANNELS, RULES } from "../config";
 import { log } from "../log";
 import { liveStars, permalinkOf } from "../slack";
 import { deleteAnnouncement, postAnnouncement, qualifies, updateAnnouncement } from "../policy";
@@ -33,6 +33,7 @@ function starTarget(event: { reaction: string; item: unknown }): StarEvent | und
   if (item?.type !== "message") return undefined;
   if (!item.channel || !item.ts) return undefined;
   if (item.channel === CHANNELS.hallOfFame) return undefined;
+  if (BLACKLISTED_CHANNELS.has(item.channel)) return undefined;
   return { channel: item.channel, ts: item.ts };
 }
 
