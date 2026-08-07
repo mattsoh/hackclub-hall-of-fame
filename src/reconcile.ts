@@ -421,7 +421,9 @@ async function reconcileBody(client: WebClient, dry: boolean, run: RunLog): Prom
         "(recorded with the right count; `hof post <link>` to announce one deliberately)"
     );
   }
-  if (queued > 0) lines.push(`• queued for approval here (over a pace limit): ${queued} — see thread`);
+  if (queued > 0) {
+    lines.push(`• queued for approval here (over a pace limit, or from an approval-only channel): ${queued} — see thread`);
+  }
   if (deferred > 0) lines.push(`• left for the next run (over the ${RULES.maxCatchUpPostsPerRun}-per-run ceiling): ${deferred}`);
   if (lookupErrors > 0) {
     const breakdown = [...errorReasons.entries()].sort((a, b) => b[1] - a[1]).map(([r, n]) => `${r}: ${n}`).join(", ");
