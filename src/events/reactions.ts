@@ -50,30 +50,54 @@ async function refreshStars(
   return { row, stars: live.stars, changed: !before || before.stars !== live.stars };
 }
 
+// Slack may deliver add/remove events for one message concurrently. Keep a
+// per-message promise chain so a post finishes (and records postedMessageId)
+// before the next event decides whether to update or delete it.
+const reactionQueues = new Map<string, Promise<void>>();
+
+function serialiseReaction(target: StarEvent, task: () => Promise<void>): Promise<void> {
+  const key = `${target.channel}/${target.ts}`;
+  const previous = reactionQueues.get(key) ?? Promise.resolve();
+  const current = previous.catch(() => undefined).then(task);
+  reactionQueues.set(key, current);
+
+  const cleanUp = () => {
+    if (reactionQueues.get(key) === current) reactionQueues.delete(key);
+  };
+  current.then(cleanUp, cleanUp);
+  return current;
+}
+
+async function handleStarChange(client: WebClient, target: StarEvent): Promise<void> {
+  await serialiseReaction(target, async () => {
+    const state = await refreshStars(client, target);
+    if (!state) return;
+    const { row, stars, changed } = state;
+
+    if (row.postedMessageId) {
+      if (!qualifies(stars)) {
+        await deleteAnnouncement(
+          client,
+          row,
+          `dropped to ${stars}⭐, below the ${RULES.starThreshold}⭐ threshold`
+        );
+      } else if (changed) {
+        await updateAnnouncement(client, row, stars);
+      }
+      return;
+    }
+
+    if (qualifies(stars)) await postAnnouncement(client, row, stars);
+  });
+}
+
 export function registerReactionEvents(app: App): void {
   app.event("reaction_added", async ({ event, client }) => {
     const target = starTarget(event);
     if (!target) return;
 
     try {
-      const state = await refreshStars(client, target);
-      if (!state) return;
-      const { row, stars, changed } = state;
-
-      // An announcement already exists: keep its number honest. This is not a
-      // new post, so it is not gated on the burst limit or on `skip`, and it is
-      // handled before either of those could suppress it.
-      if (row.postedMessageId) {
-        if (changed) await updateAnnouncement(client, row, stars);
-        return;
-      }
-
-      if (!qualifies(stars)) return;
-
-      // No age limit here, deliberately. A star landing on an old message today
-      // is an organic, real hall-of-fame entry — it's the reconciler, which
-      // looks at what the bot MISSED, that refuses to replay old backlogs.
-      await postAnnouncement(client, row, stars);
+      await handleStarChange(client, target);
     } catch (err) {
       log.error(`reaction_added failed for ${permalinkOf(target.channel, target.ts)}`, err);
     }
@@ -84,25 +108,7 @@ export function registerReactionEvents(app: App): void {
     if (!target) return;
 
     try {
-      // Records the row even if there wasn't one, so a message whose stars are
-      // being removed still ends up tracked. The old handler returned early when
-      // no row existed, which left any announcement without a row frozen at a
-      // stale count forever.
-      const state = await refreshStars(client, target);
-      if (!state) return;
-      const { row, stars, changed } = state;
-
-      if (!row.postedMessageId) return;
-
-      if (!qualifies(stars)) {
-        await deleteAnnouncement(
-          client,
-          row,
-          `dropped to ${stars}⭐, below the ${RULES.starThreshold}⭐ threshold`
-        );
-        return;
-      }
-      if (changed) await updateAnnouncement(client, row, stars);
+      await handleStarChange(client, target);
     } catch (err) {
       log.error(`reaction_removed failed for ${permalinkOf(target.channel, target.ts)}`, err);
     }
