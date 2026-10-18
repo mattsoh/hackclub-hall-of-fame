@@ -27,7 +27,7 @@ export const BOT_NAME = "Hall of Fame";
 export const RULES = {
   // Stars needed to reach #hall-of-fame. The author's own star never counts
   // toward this — see starCount() in policy.ts.
-  starThreshold: 5,
+  starThreshold: 7,
 
   // Two rate limits on #hall-of-fame itself. Both count by *when the
   // announcement was posted*, never by how old the starred message is — the

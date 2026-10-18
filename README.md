@@ -1,6 +1,6 @@
 # Hack Club's Hall of Fame
 
-A Slack bot that watches for messages with 5+ :star: reactions and posts them to
+A Slack bot that watches for messages with 7+ :star: reactions and posts them to
 [#hall-of-fame](https://hackclub.slack.com/archives/C028VGT0JMQ).
 
 ## The rules
@@ -8,10 +8,10 @@ A Slack bot that watches for messages with 5+ :star: reactions and posts them to
 All of them live in [`src/config.ts`](src/config.ts) — that is the only place to
 change any of this.
 
-- **5 stars** to qualify.
+- **7 stars** to qualify.
 - **The author's own star never counts.** Enforced in `starCount()`
   ([`src/slack.ts`](src/slack.ts)), which every path reads counts through, so a
-  message needs five stars from other people.
+  message needs seven stars from other people.
 - **At most 3 announcements per hour** in #hall-of-fame overall, and **10 per
   channel per day**. Both count when the announcement was *posted*, not how old
   the starred message is.
@@ -56,7 +56,7 @@ contents of #hall-of-fame. So it will find a message whose stars drifted, whose
 announcement was deleted, or that crossed the threshold while nobody was looking —
 but only if **at least one** star reaction on it was recorded at some point.
 
-If a message got all five of its stars during downtime and none afterwards, no row
+If a message got all seven of its stars during downtime and none afterwards, no row
 was ever created and nothing knows it exists. Any later star fixes that
 automatically (the live handler has no age limit, so it will post it then).
 Otherwise, `hof check '#channel'` scans a channel live and will find it.
